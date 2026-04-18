@@ -1,0 +1,61 @@
+# LiteLLM proxy config for ctf-cli
+# Run: litellm --config litellm_config.yaml --port 4000
+#
+# Then set:
+#   export ANTHROPIC_BASE_URL=http://localhost:4000
+#   export ANTHROPIC_API_KEY=dummy
+#
+# Usage:
+#   ctf --challenge ./chall --model <model_name below>
+
+model_list:
+  # --- OpenRouter models ---
+  - model_name: claude-opus
+    litellm_params:
+      model: openrouter/anthropic/claude-opus-4
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: claude-sonnet
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-4-5
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: qwen-72b
+    litellm_params:
+      model: openrouter/qwen/qwen-2.5-72b-instruct
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: deepseek-r1
+    litellm_params:
+      model: openrouter/deepseek/deepseek-r1
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: gemini-pro
+    litellm_params:
+      model: openrouter/google/gemini-2.0-flash-001
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: minimax-m2.5
+    litellm_params:
+      model: openrouter/minimax/minimax-m2.5:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: llama4-maverick
+    litellm_params:
+      model: openrouter/meta-llama/llama-4-maverick:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: gemini-flash-free
+    litellm_params:
+      model: openrouter/google/gemini-2.0-flash-exp:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- Local Ollama models ---
+  # - model_name: llama3
+  #   litellm_params:
+  #     model: ollama/llama3.3:70b
+  #     api_base: http://localhost:11434
+
+litellm_settings:
+  drop_params: true        # ignore unsupported params silently
+  request_timeout: 600     # 10 min timeout for long CTF tasks
