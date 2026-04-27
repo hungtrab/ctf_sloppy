@@ -11,6 +11,7 @@ mod render;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,13 +35,31 @@ fn background_pids() -> &'static Arc<Mutex<Vec<u32>>> {
 fn kill_background_pids() {
     if let Ok(pids) = background_pids().lock() {
         for &pid in pids.iter() {
-            // SIGTERM first, best-effort
             #[cfg(unix)]
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();
         }
     }
+}
+
+/// Spawns a lightweight monitor thread that watches AGENT_INTERRUPTED.
+/// When set, sends SIGKILL to all child processes so the running bash command
+/// dies immediately instead of waiting for it to react to the terminal SIGINT.
+fn spawn_interrupt_monitor() {
+    let our_pid = std::process::id().to_string();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if agent_interrupted().load(Ordering::Relaxed) {
+                // Kill all children of this process immediately.
+                // pkill -KILL -P <pid> sends SIGKILL to every child process.
+                let _ = std::process::Command::new("pkill")
+                    .args(["-KILL", "-P", &our_pid])
+                    .output();
+            }
+        }
+    });
 }
 
 use api::{
@@ -55,9 +74,11 @@ use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 #[allow(unused_imports)]
 use std::io::Write as _;
 use runtime::{
-    compact_session, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ContentBlock, ConversationMessage, ConversationRuntime, MessageRole, PermissionMode,
-    PermissionPolicy, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    compact_session, generate_pkce_pair, generate_state,
+    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
+    ContentBlock, ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest,
+    OAuthConfig, OAuthTokenSet, PermissionMode, PermissionPolicy, RuntimeError, Session,
+    TokenUsage, ToolError, ToolExecutor, parse_oauth_callback_query,
 };
 use serde_json::{json, Value};
 use tools::{execute_tool, mvp_tool_specs};
@@ -73,6 +94,49 @@ const CTF_AUTO_COMPACT_THRESHOLD: u32 = 50_000;
 
 /// Keep only last 2 messages when doing /compact (vs default 4).
 const CTF_COMPACT_PRESERVE: usize = 2;
+
+const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_OAUTH_CALLBACK_PORT: u16 = 1455;
+const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com";
+
+/// Built-in flag format list — written to the user config file on first run.
+const FLAG_FORMATS_DEFAULT: &str = "\
+FLAG{...}
+picoCTF{...}
+HTB{...}
+DUCTF{...}
+DiceCTF{...}
+CTF{...}
+LACTF{...}
+uiuctf{...}
+sekai{...}
+glacier{...}
+flag{...}
+";
+
+/// Path to the user-editable flag formats config file.
+fn flag_formats_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
+    PathBuf::from(home).join(".config/ctf-solver/flag-formats.txt")
+}
+
+/// Load flag formats from the config file, creating it with defaults if absent.
+fn load_flag_formats() -> Vec<String> {
+    let path = flag_formats_config_path();
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&path, FLAG_FORMATS_DEFAULT);
+    }
+    fs::read_to_string(&path)
+        .unwrap_or_else(|_| FLAG_FORMATS_DEFAULT.to_string())
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
 
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
@@ -92,7 +156,7 @@ fn max_tokens_for_model(model: &str) -> u32 {
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() {
-    // Kill any background processes we spawned when the process exits
+    spawn_interrupt_monitor();
     let result = run();
     kill_background_pids();
     if let Err(e) = result {
@@ -112,17 +176,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("ctf-solver {VERSION}");
             return Ok(());
         }
+        Some("login") => {
+            run_openai_login()?;
+            return Ok(());
+        }
+        Some("logout") => {
+            clear_openai_oauth()?;
+            println!("OpenAI credentials cleared.");
+            return Ok(());
+        }
         _ => {}
     }
 
-    let (challenge_dir, model, category_override, resume_path, api_mode, notify) = parse_args(&args)?;
+    let (challenge_dir, model, category_override, resume_path, mut api_mode, notify) = parse_args(&args)?;
     let mut challenge = Challenge::load(&challenge_dir);
+    let category_was_overridden = category_override.is_some();
     if let Some(cat) = category_override {
         challenge = challenge.with_category(cat);
     }
 
-    // Ensure files/ and notes.md exist
+    // Set CWD to challenge dir so relative paths (./files, ./tmp, ./notes.md) work correctly.
+    std::env::set_current_dir(&challenge.dir)?;
+
+    // Ensure files/, tmp/, and self/ exist before showing the startup screen.
     fs::create_dir_all(challenge.dir.join("files"))?;
+    fs::create_dir_all(challenge.dir.join("tmp"))?;
+    fs::create_dir_all(challenge.dir.join("self"))?;
+
+    // Startup wizard — confirms permission, category, flag format, and API mode.
+    if !startup_confirm(&mut challenge, category_was_overridden, &mut api_mode)? {
+        return Ok(());
+    }
+
+    // Create notes.md after category is finalised.
     let notes_path = challenge.dir.join("notes.md");
     if !notes_path.exists() {
         fs::write(
@@ -220,6 +306,529 @@ fn resolve_model_alias(alias: &str) -> &str {
     }
 }
 
+// ─── Startup wizard ───────────────────────────────────────────────────────────
+
+/// Four-step interactive wizard shown before the REPL:
+///   1. Workspace permission confirmation
+///   2. Category (ask only if not explicitly set)
+///   3. Flag format picker (ask only if flag_format.txt doesn't exist)
+///   4. API mode  (OpenAI OAuth  vs  API key — skip if --api flag was passed)
+/// Returns false if the user wants to abort.
+fn startup_confirm(
+    challenge: &mut Challenge,
+    category_was_overridden: bool,
+    api_mode_out: &mut Option<ApiMode>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    use io::IsTerminal as _;
+
+    if !io::stdin().is_terminal() {
+        return Ok(true);
+    }
+
+    let files_count = fs::read_dir(challenge.dir.join("files"))
+        .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).count())
+        .unwrap_or(0);
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    println!();
+    println!(" \x1b[1m\x1b[38;5;46m╭──────────────────────────────────────────────────────╮\x1b[0m");
+    println!(" \x1b[1m\x1b[38;5;46m│\x1b[0m   \x1b[1m⚡  CTF Solver\x1b[0m  \x1b[2mv{VERSION}\x1b[0m                            \x1b[1m\x1b[38;5;46m│\x1b[0m");
+    println!(" \x1b[1m\x1b[38;5;46m╰──────────────────────────────────────────────────────╯\x1b[0m");
+    println!();
+    println!("   \x1b[2mChallenge\x1b[0m   \x1b[1m{}\x1b[0m", challenge.name);
+    println!("   \x1b[2mDirectory\x1b[0m   \x1b[1m\x1b[33m{}\x1b[0m", challenge.dir.display());
+    println!("   \x1b[2mFiles\x1b[0m       {}", if files_count == 0 {
+        "\x1b[33m0 — add challenge files to ./files/\x1b[0m".to_string()
+    } else {
+        format!("{files_count} file(s)")
+    });
+    println!();
+    println!("   \x1b[33m⚠\x1b[0m  The agent will have full read/write access to this directory.");
+    println!();
+
+    // ── Step 1: workspace permission ──────────────────────────────────────────
+    if !prompt_yn("  Allow? [y]/n: ")? {
+        println!();
+        return Ok(false);
+    }
+    println!();
+
+    // ── Step 2: category (skip if explicitly set via file or --category flag) ─
+    let has_category_file = challenge.dir.join("category.txt").exists();
+    if !has_category_file && !category_was_overridden {
+        println!("  \x1b[2mCategory detected:\x1b[0m  {}  \x1b[1m{}\x1b[0m",
+            challenge.category.emoji(), challenge.category.as_str());
+        println!("  \x1b[2mpwn · web · crypto · rev · forensics · misc · osint · network\x1b[0m");
+        println!();
+
+        let default_cat = challenge.category.as_str();
+        loop {
+            print!("  Category [{default_cat}] (Enter to confirm, type to change): ");
+            let _ = io::stdout().flush();
+            let Some(line) = read_line() else { return Ok(false) };
+            match line.trim() {
+                "" => break,
+                s => match Category::from_str(s) {
+                    Some(c) => {
+                        challenge.category = c;
+                        // Persist so future runs skip this prompt.
+                        let _ = fs::write(challenge.dir.join("category.txt"), c.as_str());
+                        println!("  \x1b[38;5;46m✓\x1b[0m  {}  {}", c.emoji(), c.as_str());
+                        break;
+                    }
+                    None => println!("  \x1b[31m✗  Unknown: '{s}'\x1b[0m"),
+                },
+            }
+        }
+        println!();
+    }
+
+    // ── Step 3: flag format (skip if flag_format.txt already exists) ──────────
+    let flag_format_path = challenge.dir.join("flag_format.txt");
+    if !flag_format_path.exists() {
+        let formats = load_flag_formats();
+        let config_path = flag_formats_config_path();
+        println!("  \x1b[2mFlag format not set — choose from list or type custom:\x1b[0m");
+        println!("  \x1b[2m(edit {})\x1b[0m", config_path.display());
+        println!();
+        for (i, fmt) in formats.iter().enumerate() {
+            println!("    \x1b[2m{:2})\x1b[0m  \x1b[36m{fmt}\x1b[0m", i + 1);
+        }
+        println!("     \x1b[2m*)\x1b[0m  type a custom format  \x1b[2me.g. myctf{{...}}\x1b[0m");
+        println!();
+
+        loop {
+            print!("  Flag format [1]: ");
+            let _ = io::stdout().flush();
+            let Some(line) = read_line() else { return Ok(false) };
+            let trimmed = line.trim();
+
+            let chosen: Option<String> = if trimmed.is_empty() {
+                formats.first().cloned()
+            } else if let Ok(n) = trimmed.parse::<usize>() {
+                if n >= 1 && n <= formats.len() {
+                    Some(formats[n - 1].clone())
+                } else {
+                    println!("  \x1b[31m✗  Choose 1–{}, or type a custom format\x1b[0m", formats.len());
+                    None
+                }
+            } else if trimmed.contains('{') {
+                Some(trimmed.to_string())
+            } else {
+                println!("  \x1b[31m✗  Enter a number or a format containing '{{', e.g. FLAG{{...}}\x1b[0m");
+                None
+            };
+
+            if let Some(fmt) = chosen {
+                challenge.flag_format = fmt.clone();
+                let _ = fs::write(&flag_format_path, &fmt);
+                println!("  \x1b[38;5;46m✓\x1b[0m  \x1b[36m{fmt}\x1b[0m");
+                println!();
+                break;
+            }
+        }
+    }
+
+    // ── Step 4: API mode (skip if --api was passed explicitly) ───────────────
+    if api_mode_out.is_none() {
+        let has_oauth      = openai_credentials_path().exists();
+        let has_anth_key   = std::env::var("ANTHROPIC_API_KEY").is_ok()
+                             || std::env::var("ANTHROPIC_AUTH_TOKEN").is_ok();
+        let has_openai_key = std::env::var("OPENAI_API_KEY").is_ok()
+                             || std::env::var("OPENAI_BASE_URL").is_ok();
+
+        // Default selection based on what's already configured
+        let default_choice: u8 = if has_oauth { 1 } else { 2 };
+
+        println!("  \x1b[2mAPI mode:\x1b[0m");
+        println!("    \x1b[2m1)\x1b[0m  OpenAI / ChatGPT account  \x1b[2m(OAuth — no key needed)\x1b[0m");
+        println!("    \x1b[2m2)\x1b[0m  API key  \x1b[2m(Anthropic · OpenAI · custom endpoint)\x1b[0m");
+        println!();
+
+        let choice: u8 = loop {
+            print!("  Mode [{}]: ", default_choice);
+            let _ = io::stdout().flush();
+            let Some(line) = read_line() else { return Ok(false) };
+            match line.trim() {
+                "" => break default_choice,
+                "1" => break 1,
+                "2" => break 2,
+                _ => println!("  \x1b[31m✗  Enter 1 or 2\x1b[0m"),
+            }
+        };
+
+        println!();
+
+        match choice {
+            // ── OpenAI OAuth ──────────────────────────────────────────────────
+            1 => {
+                *api_mode_out = Some(ApiMode::OpenAi);
+                if has_oauth {
+                    println!("  \x1b[38;5;46m✓\x1b[0m  Already logged in. Using saved credentials.");
+                } else {
+                    println!("  Opening browser for OpenAI authentication...");
+                    println!();
+                    run_openai_login()?;
+                }
+            }
+            // ── API key ───────────────────────────────────────────────────────
+            _ => {
+                if has_anth_key {
+                    println!("  \x1b[38;5;46m✓\x1b[0m  ANTHROPIC_API_KEY detected.");
+                    *api_mode_out = Some(ApiMode::Anthropic);
+                } else if has_openai_key {
+                    println!("  \x1b[38;5;46m✓\x1b[0m  OPENAI_API_KEY / OPENAI_BASE_URL detected.");
+                    *api_mode_out = Some(ApiMode::OpenAi);
+                } else {
+                    // Nothing configured — ask provider + key
+                    println!("  \x1b[2mProvider:\x1b[0m");
+                    println!("    \x1b[2m1)\x1b[0m  Anthropic   \x1b[2m(claude-opus-4-6, sonnet, haiku)\x1b[0m");
+                    println!("    \x1b[2m2)\x1b[0m  OpenAI      \x1b[2m(gpt-4o, gpt-4o-mini)\x1b[0m");
+                    println!("    \x1b[2m3)\x1b[0m  Custom      \x1b[2m(Gemini, Groq, vLLM, Ollama...)\x1b[0m");
+                    println!();
+
+                    let provider: u8 = loop {
+                        print!("  Provider [1]: ");
+                        let _ = io::stdout().flush();
+                        let Some(line) = read_line() else { return Ok(false) };
+                        match line.trim() {
+                            "" | "1" => break 1,
+                            "2"      => break 2,
+                            "3"      => break 3,
+                            _ => println!("  \x1b[31m✗  Enter 1, 2, or 3\x1b[0m"),
+                        }
+                    };
+
+                    print!("  API key: ");
+                    let _ = io::stdout().flush();
+                    let Some(key_line) = read_line() else { return Ok(false) };
+                    let key = key_line.trim().to_string();
+                    if key.is_empty() {
+                        println!("  \x1b[33m⚠  No key entered — you may get auth errors.\x1b[0m");
+                    }
+
+                    match provider {
+                        1 => {
+                            std::env::set_var("ANTHROPIC_API_KEY", &key);
+                            *api_mode_out = Some(ApiMode::Anthropic);
+                            println!("  \x1b[38;5;46m✓\x1b[0m  Anthropic key set for this session.");
+                        }
+                        2 => {
+                            std::env::set_var("OPENAI_API_KEY", &key);
+                            *api_mode_out = Some(ApiMode::OpenAi);
+                            println!("  \x1b[38;5;46m✓\x1b[0m  OpenAI key set for this session.");
+                        }
+                        _ => {
+                            print!("  Base URL \x1b[2m(e.g. https://api.groq.com/openai)\x1b[0m: ");
+                            let _ = io::stdout().flush();
+                            let Some(url_line) = read_line() else { return Ok(false) };
+                            let base_url = url_line.trim().to_string();
+                            std::env::set_var("OPENAI_API_KEY", &key);
+                            if !base_url.is_empty() {
+                                std::env::set_var("OPENAI_BASE_URL", &base_url);
+                            }
+                            *api_mode_out = Some(ApiMode::OpenAi);
+                            println!("  \x1b[38;5;46m✓\x1b[0m  Custom endpoint set for this session.");
+                        }
+                    }
+                }
+            }
+        }
+        println!();
+    }
+
+    Ok(true)
+}
+
+/// Read a single line from stdin. Returns None on EOF or error.
+fn read_line() -> Option<String> {
+    let mut s = String::new();
+    match io::stdin().read_line(&mut s) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(s),
+    }
+}
+
+/// Set the terminal window/tab title using OSC 0 escape sequence.
+/// Works in xterm, iTerm2, GNOME Terminal, Windows Terminal, tmux, etc.
+fn set_terminal_title(title: &str) {
+    // OSC 0 sets both icon name and window title; BEL terminates.
+    print!("\x1b]0;{title}\x07");
+    let _ = io::stdout().flush();
+}
+
+/// Reset the terminal title to blank so the shell can take over again on exit.
+fn reset_terminal_title() {
+    print!("\x1b]0;\x07");
+    let _ = io::stdout().flush();
+}
+
+/// Prompt a yes/no question. Empty input and 'y' both mean yes.
+fn prompt_yn(prompt: &str) -> io::Result<bool> {
+    loop {
+        print!("{prompt}");
+        let _ = io::stdout().flush();
+        let line = read_line()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))?;
+        match line.trim().to_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("  Please type y or n."),
+        }
+    }
+}
+
+// ─── OpenAI OAuth ─────────────────────────────────────────────────────────────
+
+fn openai_oauth_config() -> OAuthConfig {
+    OAuthConfig {
+        client_id: OPENAI_OAUTH_CLIENT_ID.to_string(),
+        authorize_url: "https://auth.openai.com/oauth/authorize".to_string(),
+        token_url: "https://auth.openai.com/oauth/token".to_string(),
+        callback_port: Some(OPENAI_OAUTH_CALLBACK_PORT),
+        manual_redirect_url: None,
+        scopes: vec![
+            "openid".to_string(),
+            "profile".to_string(),
+            "email".to_string(),
+            "offline_access".to_string(),
+            "api.connectors.read".to_string(),
+            "api.connectors.invoke".to_string(),
+        ],
+    }
+}
+
+fn openai_credentials_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
+    PathBuf::from(home).join(".config/ctf-solver/openai-credentials.json")
+}
+
+fn load_openai_oauth() -> Option<OAuthTokenSet> {
+    let raw = fs::read_to_string(openai_credentials_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(OAuthTokenSet {
+        access_token: v["access_token"].as_str()?.to_string(),
+        refresh_token: v["refresh_token"].as_str().map(String::from),
+        expires_at: v["expires_at"].as_u64(),
+        scopes: v["scopes"].as_array()
+            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+    })
+}
+
+fn save_openai_oauth(token: &OAuthTokenSet) -> io::Result<()> {
+    let path = openai_credentials_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::json!({
+        "access_token": token.access_token,
+        "refresh_token": token.refresh_token,
+        "expires_at": token.expires_at,
+        "scopes": token.scopes,
+    });
+    let rendered = serde_json::to_string_pretty(&json)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(&path, format!("{rendered}\n"))
+}
+
+fn clear_openai_oauth() -> io::Result<()> {
+    let path = openai_credentials_path();
+    if path.exists() { fs::remove_file(path)?; }
+    Ok(())
+}
+
+/// Load saved OpenAI OAuth token and refresh it if expired.
+/// Returns the access_token string ready to use as Bearer, or None.
+fn resolve_openai_auth() -> Option<String> {
+    let token = load_openai_oauth()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?.as_secs();
+
+    // Valid token — use directly.
+    if token.expires_at.map_or(true, |exp| exp > now) {
+        return Some(token.access_token);
+    }
+
+    // Expired — try to refresh.
+    let refresh_token = token.refresh_token.clone()?;
+    let token_url = openai_oauth_config().token_url;
+    let client_id = OPENAI_OAUTH_CLIENT_ID.to_string();
+    let scopes = token.scopes.clone();
+
+    eprintln!("\x1b[2m[auth] OpenAI token expired — refreshing...\x1b[0m");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+
+    rt.block_on(async move {
+        let http = reqwest::Client::new();
+        let resp = http.post(&token_url)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
+                ("refresh_token", &refresh_token),
+            ])
+            .send().await.ok()?;
+
+        if !resp.status().is_success() { return None; }
+        let json: serde_json::Value = resp.json().await.ok()?;
+
+        let access_token = json["access_token"].as_str()?.to_string();
+        let new_refresh = json["refresh_token"].as_str()
+            .map(String::from)
+            .or(Some(refresh_token));
+        let expires_at = json["expires_in"].as_u64().map(|s| now + s);
+
+        let refreshed = OAuthTokenSet { access_token: access_token.clone(), refresh_token: new_refresh, expires_at, scopes };
+        let _ = save_openai_oauth(&refreshed);
+        Some(access_token)
+    })
+}
+
+/// Run the OpenAI OAuth PKCE login flow, save token on success.
+fn run_openai_login() -> Result<(), Box<dyn std::error::Error>> {
+    let config = openai_oauth_config();
+    let redirect_uri = format!("http://localhost:{}/auth/callback", OPENAI_OAUTH_CALLBACK_PORT);
+    let pkce = generate_pkce_pair()?;
+    let state = generate_state()?;
+
+    let authorize_url = OAuthAuthorizationRequest::from_config(
+        &config, redirect_uri.clone(), state.clone(), &pkce,
+    )
+    .with_extra_param("id_token_add_organizations", "true")
+    .with_extra_param("codex_cli_simplified_flow", "true")
+    .build_url();
+
+    println!("Starting OpenAI login...");
+    println!("Listening on {redirect_uri}");
+
+    if let Err(e) = open_browser_url(&authorize_url) {
+        eprintln!("warning: could not open browser: {e}");
+        println!("Open this URL manually:\n{authorize_url}");
+    }
+
+    // Catch the OAuth callback on localhost:1455/auth/callback
+    let listener = TcpListener::bind(("127.0.0.1", OPENAI_OAUTH_CALLBACK_PORT))
+        .map_err(|e| format!("could not bind port {OPENAI_OAUTH_CALLBACK_PORT}: {e}"))?;
+    let (mut stream, _) = listener.accept()?;
+    let mut buf = [0u8; 4096];
+    let n = {
+        use std::io::Read;
+        stream.read(&mut buf)?
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let request_line = request.lines().next().ok_or("empty callback request")?;
+    let target = request_line.split_whitespace().nth(1).ok_or("missing target")?;
+
+    // OpenAI redirects to /auth/callback (not /callback like Anthropic)
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path != "/auth/callback" {
+        return Err(format!("unexpected callback path: {path}").into());
+    }
+    let callback = parse_oauth_callback_query(query)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let body = if callback.error.is_some() {
+        "OpenAI login failed. You can close this window."
+    } else {
+        "OpenAI login succeeded. You can close this window."
+    };
+    let http_resp = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(), body
+    );
+    stream.write_all(http_resp.as_bytes())?;
+    drop(stream);
+
+    if let Some(err) = callback.error {
+        let desc = callback.error_description.unwrap_or_else(|| "auth failed".to_string());
+        return Err(format!("{err}: {desc}").into());
+    }
+    let code = callback.code.ok_or("callback missing authorization code")?;
+    let returned_state = callback.state.ok_or("callback missing state")?;
+    if returned_state != state {
+        return Err("OAuth state mismatch — possible CSRF attack".into());
+    }
+
+    // Exchange authorization code for tokens
+    let token_url = config.token_url.clone();
+    let client_id = config.client_id.clone();
+    let verifier = pkce.verifier.clone();
+    let redirect_uri_clone = redirect_uri.clone();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let token = rt.block_on(async move {
+        let http = reqwest::Client::new();
+        let resp = http.post(&token_url)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", &redirect_uri_clone),
+                ("client_id", &client_id),
+                ("code_verifier", &verifier),
+            ])
+            .send().await
+            .map_err(|e| format!("token exchange request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("token exchange failed {status}: {text}"));
+        }
+
+        let json: serde_json::Value = resp.json().await
+            .map_err(|e| format!("token parse failed: {e}"))?;
+
+        let access_token = json["access_token"].as_str()
+            .ok_or("missing access_token")?.to_string();
+        let refresh_token = json["refresh_token"].as_str().map(String::from);
+        let scope = json["scope"].as_str().unwrap_or("").to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs();
+        let expires_at = json["expires_in"].as_u64().map(|s| now + s);
+
+        Ok(OAuthTokenSet {
+            access_token,
+            refresh_token,
+            expires_at,
+            scopes: scope.split_whitespace().map(String::from).collect(),
+        })
+    })?;
+
+    save_openai_oauth(&token)?;
+    println!("Login complete. Credentials saved to {}", openai_credentials_path().display());
+    println!("Run `ctf <challenge> --model gpt-4o` to start solving.");
+    Ok(())
+}
+
+fn open_browser_url(url: &str) -> io::Result<()> {
+    let cmds: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("open", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("cmd", &["/C", "start", ""])]
+    } else {
+        &[("xdg-open", &[]), ("sensible-browser", &[])]
+    };
+    for (prog, prefix_args) in cmds {
+        let mut cmd = std::process::Command::new(prog);
+        cmd.args(*prefix_args).arg(url);
+        match cmd.spawn() {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "no browser opener found"))
+}
+
 fn print_help() {
     println!(
         "ctf-solver {VERSION} — autonomous CTF challenge solver
@@ -227,6 +836,8 @@ fn print_help() {
 USAGE
   ctf --challenge <dir> [OPTIONS]
   ctf <dir>             # shorthand
+  ctf login             # log in with OpenAI account (OAuth)
+  ctf logout            # clear saved OpenAI credentials
 
 OPTIONS
   --challenge, -c <dir>       Challenge directory (must contain files/ subdir)
@@ -263,7 +874,8 @@ ENVIRONMENT
 CHALLENGE DIRECTORY LAYOUT
   <dir>/
     files/             Challenge binaries, source, pcap, images...
-    description.txt    Challenge description (optional)
+    self/              Your private notes — agent cannot read this folder
+    desc.txt           Challenge description (optional)
     category.txt       Single-word category override (optional)
     flag_format.txt    e.g. picoCTF{{...}} (optional, default FLAG{{...}})
     notes.md           Auto-created, agent appends findings here"
@@ -308,12 +920,15 @@ fn run_repl(
         "/hint".to_string(), "/submit".to_string(), "/notes".to_string(),
         "/files".to_string(), "/reset".to_string(), "/category".to_string(),
         "/status".to_string(), "/compact".to_string(), "/cost".to_string(),
-        "/export".to_string(), "/help".to_string(), "/exit".to_string(),
+        "/export".to_string(), "/writeup".to_string(), "/help".to_string(), "/exit".to_string(),
     ];
     let mut editor = input::LineEditor::new(
         format!("\x1b[38;5;46m[{}]\x1b[0m > ", challenge.category.as_str()),
         completions,
     );
+
+    // Set terminal title to challenge name so it's visible in the tab/taskbar.
+    set_terminal_title(&format!("⚡ {} [{}]", challenge.name, challenge.category.as_str()));
 
     println!("{}", cli.banner());
 
@@ -371,6 +986,7 @@ fn run_repl(
         }
     }
 
+    reset_terminal_title();
     Ok(())
 }
 
@@ -442,7 +1058,7 @@ impl CtfCli {
   \x1b[38;5;196mPermissions: NONE (allow-all)\x1b[0m  \
 \x1b[38;5;208mSandbox: OFF\x1b[0m  \
 \x1b[38;5;226mCompact: 50k tokens\x1b[0m\n\n\
-  /hint  /submit <flag>  /notes  /files  /reset  /help",
+  /hint  /submit <flag>  /notes  /files  /writeup  /reset  /help",
             name     = self.challenge.name,
             emoji    = self.challenge.category.emoji(),
             cat      = self.challenge.category.as_str(),
@@ -470,7 +1086,35 @@ impl CtfCli {
         let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(flag));
 
         // ── No prompter = zero approval dialogs ──────────────────────────────
-        let result = self.runtime.run_turn(input, None);
+        let mut result = self.runtime.run_turn(input, None);
+
+        // 413 / 524 → session too large; auto-compact and retry once
+        if let Err(ref e) = result {
+            let emsg = e.to_string();
+            if emsg.contains("413") || emsg.contains("524") {
+                spinner.tick("⚡ context too large — compacting session and retrying...",
+                    TerminalRenderer::new().color_theme(), &mut stdout)?;
+                let compacted = compact_session(
+                    self.runtime.session(),
+                    CompactionConfig {
+                        preserve_recent_messages: CTF_COMPACT_PRESERVE,
+                        max_estimated_tokens: 0,
+                    },
+                );
+                let removed = compacted.removed_message_count;
+                let api_client = CtfApiClient::new(self.model.clone(), self.api_mode)?;
+                self.runtime = ConversationRuntime::new(
+                    compacted.compacted_session,
+                    api_client,
+                    CtfToolExecutor::new(),
+                    PermissionPolicy::new(PermissionMode::Allow),
+                    self.system_prompt.clone(),
+                )
+                .with_auto_compaction_input_tokens_threshold(CTF_AUTO_COMPACT_THRESHOLD);
+                eprintln!("\x1b[2m[compact] removed {removed} messages, retrying\x1b[0m");
+                result = self.runtime.run_turn(input, None);
+            }
+        }
 
         let interrupted = flag.swap(false, Ordering::Relaxed);
 
@@ -526,6 +1170,7 @@ impl CtfCli {
                 self.persist()?;
                 if self.notify {
                     send_desktop_notification(&self.challenge.name, "Agent finished");
+                    play_sound();
                 }
                 Ok(())
             }
@@ -533,12 +1178,15 @@ impl CtfCli {
                 if interrupted || error.to_string().contains("interrupted") {
                     spinner.finish("⏸ Paused", TerminalRenderer::new().color_theme(), &mut stdout)?;
                     println!("\n\x1b[33mAgent paused. Session saved. Continue with your next message.\x1b[0m\n");
-                    let _ = self.persist();
-                    Ok(())
                 } else {
                     spinner.fail("❌ Failed", TerminalRenderer::new().color_theme(), &mut stdout)?;
-                    Err(Box::new(error))
+                    eprintln!("\n\x1b[31merror: {error}\x1b[0m");
+                    eprintln!("\x1b[33mSession saved. You can retry or continue with a new message.\x1b[0m\n");
                 }
+                // Always persist — the runtime may have completed some tool calls
+                // before the failure, so partial progress is worth keeping.
+                let _ = self.persist();
+                Ok(())
             }
         }
     }
@@ -580,7 +1228,7 @@ impl CtfCli {
                 let path = self.challenge.dir.join("notes.md");
                 match fs::read_to_string(&path) {
                     Ok(content) => println!("{content}"),
-                    Err(_) => println!("(no notes yet — {}", path.display()),
+                    Err(_) => println!("(no notes yet — {})", path.display()),
                 }
             }
             "files" => {
@@ -694,6 +1342,68 @@ impl CtfCli {
                     println!("\x1b[33m🔕 Desktop notifications OFF\x1b[0m");
                 }
             }
+            "writeup" => {
+                let output_path = self.challenge.dir.join("writeup.md");
+                let prompt = format!(
+                    r#"Write a thorough CTF writeup for the challenge '{}' (category: {}, flag format: {}).
+
+Save the writeup to `./writeup.md` using bash.
+
+The writeup must be in English and follow this structure:
+
+# {name} — CTF Writeup
+
+## Challenge Overview
+- **Category**: {cat}
+- **Flag format**: {flag_fmt}
+- Brief description and what kind of vulnerability/technique is involved.
+
+## Initial Reconnaissance
+Walk through every observation made during the initial triage:
+file types, strings, metadata, network ports, source code review — whatever
+applied. Explain *why* each observation matters.
+
+## Analysis
+Step-by-step breakdown of the full analysis. For each step:
+- What you observed or tried
+- What the result told you
+- How it led to the next step
+Do not skip failed attempts if they led somewhere; they are part of the story.
+
+## Exploitation / Solution
+Detailed explanation of the final approach:
+- The vulnerability or logic flaw exploited
+- Why it works (conceptual explanation)
+- The exact sequence of actions taken
+
+## Reproduction Guide
+Provide a complete, self-contained guide to reproduce the flag from scratch.
+Prefer Python scripts or pwntools/requests/Crypto code over raw CLI one-liners.
+Include every command or script needed, with comments explaining each part.
+A reader with no prior context should be able to follow this section alone and
+get the flag.
+
+## Flag
+```
+FLAG HERE
+```
+
+## Key Takeaways
+1-3 bullet points: what technique or concept this challenge demonstrates.
+
+---
+
+Write the file now using bash, then confirm the path."#,
+                    self.challenge.name,
+                    self.challenge.category.as_str(),
+                    self.challenge.flag_format,
+                    name = self.challenge.name,
+                    cat = self.challenge.category.as_str(),
+                    flag_fmt = self.challenge.flag_format,
+                );
+                println!("\x1b[2mGenerating writeup → {}\x1b[0m\n", output_path.display());
+                self.run_turn(&prompt)?;
+            }
             "help" => print_repl_help(),
             _ => println!("Unknown command: /{cmd}  — type /help"),
         }
@@ -737,6 +1447,7 @@ fn print_repl_help() {
   /compact              Force-compact conversation history
   /cost                 Token usage breakdown
   /export [path]        Export transcript
+  /writeup              Generate a detailed writeup and save to writeup.md
   /help                 This help
   /exit, /quit          Exit and save session
 
@@ -795,10 +1506,14 @@ impl CtfApiClient {
 
         // Resolve effective mode:
         //   1. --api flag (mode_override) takes priority
-        //   2. OPENAI_BASE_URL env var → OpenAI mode
-        //   3. fallback → Anthropic mode
+        //   2. OPENAI_BASE_URL / OPENAI_API_KEY env vars → OpenAI mode
+        //   3. Saved OpenAI OAuth credentials → OpenAI mode
+        //   4. fallback → Anthropic mode
         let effective_mode = mode_override.unwrap_or_else(|| {
-            if std::env::var("OPENAI_BASE_URL").is_ok() {
+            if std::env::var("OPENAI_BASE_URL").is_ok()
+                || std::env::var("OPENAI_API_KEY").is_ok()
+                || openai_credentials_path().exists()
+            {
                 ApiMode::OpenAi
             } else {
                 ApiMode::Anthropic
@@ -808,11 +1523,13 @@ impl CtfApiClient {
         let backend = match effective_mode {
             ApiMode::OpenAi => {
                 let base_url = std::env::var("OPENAI_BASE_URL")
-                    .unwrap_or_else(|_| "http://localhost:8000".to_string());
+                    .unwrap_or_else(|_| OPENAI_DEFAULT_BASE_URL.to_string());
                 let api_key = std::env::var("OPENAI_API_KEY")
-                    .unwrap_or_else(|_| "dummy".to_string());
+                    .ok()
+                    .or_else(resolve_openai_auth)
+                    .unwrap_or_else(|| "dummy".to_string());
                 let http = reqwest::Client::new();
-                eprintln!("\x1b[2m[api] OpenAI-compatible mode → {base_url}\x1b[0m");
+                eprintln!("\x1b[2m[api] OpenAI mode → {base_url}\x1b[0m");
                 ApiBackend::OpenAi { base_url, api_key, http }
             }
             ApiMode::Anthropic => {
@@ -847,7 +1564,7 @@ impl ApiClient for CtfApiClient {
 
 impl CtfApiClient {
     fn stream_anthropic(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let tool_defs: Vec<ToolDefinition> = mvp_tool_specs()
+        let tool_defs: Vec<ToolDefinition> = ctf_tool_specs()
             .into_iter()
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
@@ -991,7 +1708,7 @@ impl CtfApiClient {
             format!("{base}/v1/chat/completions")
         };
 
-        let tools_json: Vec<Value> = mvp_tool_specs()
+        let tools_json: Vec<Value> = ctf_tool_specs()
             .into_iter()
             .map(|spec| json!({
                 "type": "function",
@@ -1022,61 +1739,52 @@ impl CtfApiClient {
         });
 
         self.tokio_rt.block_on(async {
-            // Retry on 502/503/504 up to 3 times with backoff
-            let resp = {
-                let mut last_err = None;
-                let mut result = None;
-                for attempt in 0..3u32 {
-                    if attempt > 0 {
-                        let wait = std::time::Duration::from_secs(2u64.pow(attempt));
-                        eprintln!("\x1b[2m[api] retrying in {}s (attempt {}/3)...\x1b[0m", wait.as_secs(), attempt + 1);
-                        tokio::time::sleep(wait).await;
-                    }
-                    match http.post(&endpoint).bearer_auth(&api_key).json(&body).send().await {
-                        Err(e) => { last_err = Some(format!("openai request failed: {e}")); }
-                        Ok(r) => {
-                            let status = r.status();
-                            if matches!(status.as_u16(), 502 | 503 | 504) && attempt < 2 {
-                                let text = r.text().await.unwrap_or_default();
-                                last_err = Some(format!("openai api returned {status}: {text}"));
-                                continue;
-                            }
-                            result = Some(r);
-                            break;
-                        }
-                    }
-                }
-                match result {
-                    Some(r) => r,
-                    None => return Err(RuntimeError::new(last_err.unwrap_or_default())),
-                }
-            };
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(RuntimeError::new(format!("openai api returned {status}: {text}")));
-            }
-
-            let renderer = TerminalRenderer::new();
-            let mut markdown_state = MarkdownStreamState::default();
-            let mut stdout = io::stdout();
-            let mut events: Vec<AssistantEvent> = Vec::new();
-
-            // Accumulate tool calls by index: index → (id, name, arguments)
-            let mut pending_tools: std::collections::HashMap<usize, (String, String, String)> =
-                std::collections::HashMap::new();
-
-            let bytes = resp.bytes_stream();
             use futures_util::StreamExt;
-            // reqwest bytes_stream is already a Stream<Item=Result<Bytes>>
-            // We need to split on newlines manually
-            let mut buf = String::new();
+            let mut last_err = String::new();
 
-            tokio::pin!(bytes);
-            while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.map_err(|e| RuntimeError::new(e.to_string()))?;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
+            for attempt in 0..3u32 {
+                if attempt > 0 {
+                    let wait = std::time::Duration::from_secs(2u64.pow(attempt));
+                    eprintln!("\x1b[2m[api] retrying in {}s (attempt {}/3)...\x1b[0m", wait.as_secs(), attempt + 1);
+                    tokio::time::sleep(wait).await;
+                }
+
+                let resp = match http.post(&endpoint).bearer_auth(&api_key).json(&body).send().await {
+                    Err(e) => { last_err = format!("openai request failed: {e}"); continue; }
+                    Ok(r) => r,
+                };
+
+                let status = resp.status();
+                // Transient server/gateway errors → retry
+                if matches!(status.as_u16(), 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524) {
+                    let text = resp.text().await.unwrap_or_default();
+                    last_err = format!("openai api returned {status}: {text}");
+                    continue;
+                }
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(RuntimeError::new(format!("openai api returned {status}: {text}")));
+                }
+
+                let renderer = TerminalRenderer::new();
+                let mut markdown_state = MarkdownStreamState::default();
+                let mut stdout = io::stdout();
+                let mut events: Vec<AssistantEvent> = Vec::new();
+
+                let mut pending_tools: std::collections::HashMap<usize, (String, String, String)> =
+                    std::collections::HashMap::new();
+
+                let bytes = resp.bytes_stream();
+                let mut buf = String::new();
+                let mut stream_err: Option<String> = None;
+
+                tokio::pin!(bytes);
+                'stream: while let Some(chunk) = bytes.next().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => { stream_err = Some(e.to_string()); break 'stream; }
+                    };
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
 
                 // Process complete lines
                 while let Some(pos) = buf.find('\n') {
@@ -1185,24 +1893,196 @@ impl CtfApiClient {
             }
 
             // Flush remaining markdown
-            if let Some(rendered) = markdown_state.flush(&renderer) {
-                write!(stdout, "{rendered}")
-                    .and_then(|()| stdout.flush())
-                    .map_err(|e| RuntimeError::new(e.to_string()))?;
-            }
-
-            // Emit stop if not yet emitted
-            if !events.iter().any(|e| matches!(e, AssistantEvent::MessageStop)) {
-                if events.iter().any(|e| {
-                    matches!(e, AssistantEvent::TextDelta(t) if !t.is_empty())
-                        || matches!(e, AssistantEvent::ToolUse { .. })
-                }) {
-                    events.push(AssistantEvent::MessageStop);
+                if let Some(rendered) = markdown_state.flush(&renderer) {
+                    write!(stdout, "{rendered}")
+                        .and_then(|()| stdout.flush())
+                        .map_err(|e| RuntimeError::new(e.to_string()))?;
                 }
+
+                // Stream dropped mid-way → retry
+                if let Some(e) = stream_err {
+                    last_err = format!("error decoding response body: {e}");
+                    // Print a visible break so the user knows the previous output was partial.
+                    eprintln!("\x1b[2m[api] stream interrupted — retrying...\x1b[0m");
+                    continue;
+                }
+
+                // Emit stop if not yet emitted
+                if !events.iter().any(|e| matches!(e, AssistantEvent::MessageStop)) {
+                    if events.iter().any(|e| {
+                        matches!(e, AssistantEvent::TextDelta(t) if !t.is_empty())
+                            || matches!(e, AssistantEvent::ToolUse { .. })
+                    }) {
+                        events.push(AssistantEvent::MessageStop);
+                    }
+                }
+
+                return Ok(events);
             }
 
-            Ok(events)
+            Err(RuntimeError::new(last_err))
         })
+    }
+}
+
+// ─── CTF-specific tool implementations ───────────────────────────────────────
+
+fn sh(cmd: &str) -> String {
+    std::process::Command::new("sh")
+        .args(["-c", cmd])
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            if out.trim().is_empty() { err.into_owned() } else { out.into_owned() }
+        })
+        .unwrap_or_default()
+}
+
+/// All-in-one binary fingerprint: file + checksec + strings + ldd + arch.
+fn ctf_binary_recon(path: &str) -> Result<String, String> {
+    // Sanitise path for shell use
+    let esc = path.replace('\'', "'\\''");
+    let mut out = String::new();
+
+    out.push_str(&format!("=== file ===\n{}\n", sh(&format!("file '{esc}'"))));
+
+    let checksec = sh(&format!("checksec --file='{esc}' 2>/dev/null || checksec --binary='{esc}' 2>/dev/null"));
+    if !checksec.trim().is_empty() {
+        out.push_str(&format!("=== checksec ===\n{checksec}\n"));
+    } else {
+        // Fallback: read ELF flags manually with readelf
+        let readelf = sh(&format!("readelf -W -d '{esc}' 2>/dev/null | grep -E 'BIND_NOW|RELRO|FLAGS'"));
+        let header  = sh(&format!("readelf -h '{esc}' 2>/dev/null | grep -E 'Class|Machine|Type'"));
+        out.push_str(&format!("=== readelf (no checksec) ===\n{header}{readelf}\n"));
+    }
+
+    out.push_str(&format!("=== ldd ===\n{}\n", sh(&format!("ldd '{esc}' 2>/dev/null || echo '(not dynamic ELF)'"))));
+
+    let strings = sh(&format!("strings -n8 '{esc}' 2>/dev/null | head -60"));
+    out.push_str(&format!("=== strings (first 60) ===\n{strings}\n"));
+
+    Ok(out.trim_end().to_string())
+}
+
+/// Decompile a function using radare2 (r2). Falls back to objdump disassembly.
+fn ctf_decompile(path: &str, function: &str) -> Result<String, String> {
+    let esc  = path.replace('\'', "'\\''");
+    let func = function.replace('\'', "");
+
+    // radare2: try multiple name conventions (sym.func, func, import.func)
+    let r2_cmd = format!(
+        "r2 -A -q -c 'pdf @ sym.{func} 2>/dev/null; pdf @ {func} 2>/dev/null' '{esc}' 2>/dev/null | head -300"
+    );
+    let r2_out = sh(&r2_cmd);
+    if !r2_out.trim().is_empty() && !r2_out.contains("Cannot find function") {
+        return Ok(format!("=== radare2: {func} ===\n{r2_out}"));
+    }
+
+    // Fallback: objdump
+    let objdump_cmd = format!(
+        "objdump -d -M intel '{esc}' 2>/dev/null \
+         | awk '/<{func}[>@]/ {{f=1}} f {{print; lines++; if (/^$/ && lines>5) exit}}' \
+         | head -200"
+    );
+    let objdump_out = sh(&objdump_cmd);
+    if !objdump_out.trim().is_empty() {
+        return Ok(format!("=== objdump: {func} ===\n{objdump_out}"));
+    }
+
+    Err(format!(
+        "Could not decompile '{func}' in '{path}'. \
+         Is radare2 installed? (apt install radare2). \
+         Try: binary_recon to list available symbols first."
+    ))
+}
+
+// ─── Sound notification ───────────────────────────────────────────────────────
+
+fn sound_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
+    PathBuf::from(home).join(".config/ctf-solver/sound.txt")
+}
+
+/// System sound files tried in order on first run to find a usable default.
+const CANDIDATE_SOUNDS: &[&str] = &[
+    "/usr/share/sounds/Yaru/stereo/complete.oga",
+    "/usr/share/sounds/freedesktop/stereo/complete.oga",
+    "/usr/share/sounds/ubuntu/stereo/message-new-instant.ogg",
+    "/usr/share/sounds/Yaru/stereo/message.oga",
+    "/usr/share/sounds/sound-icons/prompt.wav",
+    "/usr/share/sounds/speech-dispatcher/dummy-message.wav",
+];
+
+/// Load the configured sound path.
+/// On first run, auto-detect a system sound and save it to the config file.
+/// Returns None if sound is disabled ("none") or no sound is found.
+fn load_sound_path() -> Option<String> {
+    let cfg = sound_config_path();
+
+    if cfg.exists() {
+        let raw = fs::read_to_string(&cfg).ok()?;
+        // Strip comment lines, take first non-empty line
+        let path = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .find(|l| !l.trim().is_empty())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        return if path.eq_ignore_ascii_case("none") || path.is_empty() {
+            None
+        } else {
+            Some(path)
+        };
+    }
+
+    // First run — find a usable sound file from system defaults
+    let found = CANDIDATE_SOUNDS
+        .iter()
+        .find(|&&p| std::path::Path::new(p).exists())
+        .map(|&p| p.to_string());
+
+    // Persist the choice (or "none") so the user can see and edit it
+    if let Some(parent) = cfg.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let content = format!(
+        "# CTF Solver — notification sound\n\
+         # Set to the path of any audio file, or 'none' to disable.\n\
+         # Players tried: ffplay, paplay, cvlc, aplay\n\
+         {}\n",
+        found.as_deref().unwrap_or("none")
+    );
+    let _ = fs::write(&cfg, content);
+
+    found
+}
+
+/// Play the configured notification sound in the background (non-blocking).
+/// Tries multiple players until one succeeds.
+fn play_sound() {
+    let Some(path) = load_sound_path() else { return };
+
+    // (program, args-before-file)
+    let players: &[(&str, &[&str])] = &[
+        ("ffplay",  &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+        ("paplay",  &[]),
+        ("cvlc",    &["--play-and-exit", "--quiet", "--no-interact"]),
+        ("aplay",   &["-q"]),
+        ("mpv",     &["--no-video", "--really-quiet"]),
+    ];
+
+    for (prog, pre_args) in players {
+        let mut cmd = std::process::Command::new(prog);
+        cmd.args(*pre_args).arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(_) => return, // fire-and-forget
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        }
     }
 }
 
@@ -1248,6 +2128,25 @@ fn format_ctf_tool_call(name: &str, input: &str) -> String {
         "grep_search" => {
             let pat = parsed.get("pattern").and_then(Value::as_str).unwrap_or("?");
             format!("\x1b[38;5;147m🔍 grep_search\x1b[0m \x1b[2m{pat}\x1b[0m")
+        }
+        "binary_recon" => {
+            let path = parsed.get("path").and_then(Value::as_str).unwrap_or("?");
+            format!("\x1b[38;5;196m🔬 binary_recon\x1b[0m \x1b[2m{path}\x1b[0m")
+        }
+        "decompile" => {
+            let path = parsed.get("path").and_then(Value::as_str).unwrap_or("?");
+            let func = parsed.get("function").and_then(Value::as_str).unwrap_or("main");
+            format!("\x1b[38;5;213m🧩 decompile\x1b[0m \x1b[2m{path}:{func}\x1b[0m")
+        }
+        "REPL" => {
+            let lang = parsed.get("language").and_then(Value::as_str).unwrap_or("?");
+            let code = parsed.get("code").and_then(Value::as_str).unwrap_or("");
+            format!("\x1b[38;5;83m🐍 REPL[{lang}]\x1b[0m \x1b[2m{}\x1b[0m",
+                code.lines().next().unwrap_or(""))
+        }
+        "WebFetch" => {
+            let url = parsed.get("url").and_then(Value::as_str).unwrap_or("?");
+            format!("\x1b[38;5;75m🌐 WebFetch\x1b[0m \x1b[2m{url}\x1b[0m")
         }
         _ => format!("\x1b[2m[{name}]\x1b[0m"),
     }
@@ -1302,7 +2201,25 @@ impl ToolExecutor for CtfToolExecutor {
         let _ = writeln!(stdout, "{call_display}");
         let _ = stdout.flush();
 
-        let result = execute_tool(tool_name, &effective_input);
+        // CTF-specific tools handled before delegating to the shared executor
+        let result = match tool_name {
+            "binary_recon" => {
+                let path = effective_input.get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ToolError::new("binary_recon requires 'path'"))?;
+                ctf_binary_recon(path).map_err(ToolError::new)
+            }
+            "decompile" => {
+                let path = effective_input.get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ToolError::new("decompile requires 'path'"))?;
+                let func = effective_input.get("function")
+                    .and_then(Value::as_str)
+                    .unwrap_or("main");
+                ctf_decompile(path, func).map_err(ToolError::new)
+            }
+            _ => execute_tool(tool_name, &effective_input).map_err(ToolError::new),
+        };
 
         match result {
             Ok(output) => {
@@ -1325,11 +2242,11 @@ impl ToolExecutor for CtfToolExecutor {
                 let _ = self.renderer.stream_markdown(&md, &mut stdout);
                 Ok(output)
             }
-            Err(error) => {
-                let md = format!("\n\x1b[31m✘ {error}\x1b[0m\n");
+            Err(err) => {
+                let md = format!("\n\x1b[31m✘ {err}\x1b[0m\n");
                 let _ = write!(stdout, "{md}");
                 let _ = stdout.flush();
-                Err(ToolError::new(error))
+                Err(err)
             }
         }
     }
@@ -1389,7 +2306,7 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     ContentBlock::ToolResult { tool_use_id, output, is_error, .. } => {
                         Some(InputContentBlock::ToolResult {
                             tool_use_id: tool_use_id.clone(),
-                            content: vec![ToolResultContentBlock::Text { text: output.clone() }],
+                            content: vec![ToolResultContentBlock::Text { text: truncate_tool_output(output) }],
                             is_error: *is_error,
                         })
                     }
@@ -1404,10 +2321,83 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
         .collect()
 }
 
+// ─── CTF tool specs ───────────────────────────────────────────────────────────
+// Pruned subset of mvp_tool_specs() + two CTF-specific additions.
+// Sending fewer, relevant tools reduces model confusion and saves context tokens.
+
+fn ctf_tool_specs() -> Vec<tools::ToolSpec> {
+    // Keep only tools relevant to CTF work; drop Todo, Skill, Agent, Config, etc.
+    let keep: &[&str] = &[
+        "bash", "read_file", "write_file", "edit_file",
+        "glob_search", "grep_search", "WebFetch", "WebSearch",
+        "REPL", "Sleep", "SendUserMessage",
+    ];
+
+    let mut specs: Vec<tools::ToolSpec> = mvp_tool_specs()
+        .into_iter()
+        .filter(|s| keep.contains(&s.name))
+        .collect();
+
+    // ── binary_recon ─────────────────────────────────────────────────────────
+    // One call instead of 4-5 bash calls: file + checksec + strings + ldd + arch.
+    specs.push(tools::ToolSpec {
+        name: "binary_recon",
+        description: "All-in-one binary fingerprint: file type, ELF security flags (NX/PIE/canary/RELRO), \
+                       linked libraries, architecture, and a strings preview. Use this as the first step \
+                       on any binary before running GDB or writing an exploit.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path to the binary file" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        required_permission: runtime::PermissionMode::ReadOnly,
+    });
+
+    // ── decompile ─────────────────────────────────────────────────────────────
+    // Runs radare2 (or objdump fallback) to get pseudocode for a function.
+    specs.push(tools::ToolSpec {
+        name: "decompile",
+        description: "Decompile a specific function in a binary using radare2 (r2). \
+                       Returns assembly + pseudocode. Use for rev/pwn to understand logic \
+                       without manually reading objdump output.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path":     { "type": "string", "description": "Path to the binary" },
+                "function": { "type": "string", "description": "Function name (e.g. 'main', 'vuln'). Default: main" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        required_permission: runtime::PermissionMode::ReadOnly,
+    });
+
+    specs
+}
+
 /// Convert runtime messages to OpenAI chat format.
 /// Key differences from Anthropic:
 ///   - Tool results → separate messages with role="tool"
 ///   - Tool calls   → "tool_calls" array in assistant message
+/// OpenAI API rejects tool outputs longer than 10 MB. Cap at 200 KB of UTF-8 chars.
+const MAX_TOOL_OUTPUT_CHARS: usize = 200_000;
+
+fn truncate_tool_output(s: &str) -> String {
+    let total_chars = s.chars().count();
+    if total_chars <= MAX_TOOL_OUTPUT_CHARS {
+        return s.to_string();
+    }
+    let keep = MAX_TOOL_OUTPUT_CHARS.saturating_sub(80);
+    // Collect up to `keep` chars safely, avoiding mid-codepoint byte slices.
+    let truncated: String = s.chars().take(keep).collect();
+    format!(
+        "{truncated}\n\n[... output truncated: {total_chars} chars total, showing first {keep} chars ...]",
+    )
+}
+
 fn convert_messages_openai(messages: &[ConversationMessage]) -> Vec<Value> {
     // Collect all tool_call IDs that actually exist in assistant messages.
     // After compaction, some tool_results may reference IDs whose assistant
@@ -1468,6 +2458,7 @@ fn convert_messages_openai(messages: &[ConversationMessage]) -> Vec<Value> {
                     out.push(json!({ "role": "user", "content": text_parts.join("\n") }));
                 }
                 for (tool_call_id, content) in tool_results {
+                    let content = truncate_tool_output(&content);
                     out.push(json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content }));
                 }
             }

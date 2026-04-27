@@ -74,12 +74,16 @@ impl Challenge {
     ///     category.txt    ← single word category (optional)
     ///     flag_format.txt ← e.g. "picoCTF{...}" (optional)
     pub fn load(dir: &Path) -> Self {
-        let name = dir
-            .file_name()
+        // Canonicalize so "." or "../foo" resolve to the real directory name.
+        let name = fs::canonicalize(dir)
+            .ok()
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .or_else(|| dir.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "challenge".to_string());
 
-        let description = fs::read_to_string(dir.join("description.txt"))
+        let description = fs::read_to_string(dir.join("desc.txt"))
             .unwrap_or_default()
             .trim()
             .to_string();
@@ -118,10 +122,6 @@ impl Challenge {
         if extensions.iter().any(|e| matches!(e.as_str(), "apk" | "jar" | "class" | "dex")) {
             return Category::Rev;
         }
-        if has_elf && !description.to_lowercase().contains("disassem") {
-            // ELF + no explicit rev keywords → likely pwn
-        }
-
         // 3. Description keywords
         let desc = description.to_lowercase();
         if desc.contains("overflow") || desc.contains("heap") || desc.contains("rop")

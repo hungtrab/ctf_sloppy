@@ -1,148 +1,267 @@
 # CTF Solver CLI
 
-Terminal agent tự động giải CTF, dùng LLM (Claude hoặc OpenAI-compatible).
+Terminal agent tự động giải CTF. Hỗ trợ Claude (Anthropic), ChatGPT (OpenAI OAuth — không cần API key riêng), và bất kỳ OpenAI-compatible endpoint nào (Gemini, Groq, vLLM, Ollama...).
+
+---
+
+## Yêu cầu
+
+- Linux (x86_64)
+- Rust ≥ 1.80 — install script tự cài nếu chưa có
+- `notify-send` để bật desktop notification (tuỳ chọn): `sudo apt install libnotify-bin`
+- `ffplay` / `paplay` / `cvlc` để bật âm thanh (tuỳ chọn): `sudo apt install ffmpeg`
 
 ---
 
 ## Cài đặt
 
-### Yêu cầu
-
-- Linux (x86_64 hoặc arm64)
-- Rust ≥ 1.80 (script tự cài nếu chưa có)
-- `notify-send` để nhận desktop notification (tuỳ chọn)
-  ```
-  sudo apt install libnotify-bin
-  ```
-
-### Cài nhanh
-
 ```bash
-git clone <repo>
+git clone <repo-url>
 cd ctf-solver-release
 ./install.sh
 ```
 
-Script sẽ build và copy binary `ctf` vào `~/.local/bin/`.
+Script tự build release binary và copy vào `~/.local/bin/ctf`. Kiểm tra:
+
+```bash
+ctf --version
+ctf --help
+```
+
+---
+
+## Cài CTF skill references (tuỳ chọn, khuyến nghị)
+
+Clone bộ technique reference vào `~/.local/share/ctf-skills`. Agent sẽ tự đọc file kỹ thuật phù hợp với category của challenge:
+
+```bash
+git clone https://github.com/ljagiello/ctf-skills ~/.local/share/ctf-skills
+```
+
+Cập nhật định kỳ:
+
+```bash
+git -C ~/.local/share/ctf-skills pull
+```
 
 ---
 
 ## Cấu hình API
 
-### Dùng Claude (Anthropic)
+Khi khởi chạy, wizard sẽ hỏi chọn chế độ. Có thể cấu hình sẵn bằng env var để wizard tự detect và skip bước hỏi.
+
+### Chế độ 1 — OpenAI / ChatGPT account (OAuth, không cần API key riêng)
+
+Đăng nhập một lần, credentials lưu ở `~/.config/ctf-solver/openai-credentials.json`:
+
+```bash
+ctf login
+```
+
+Mở browser → đăng nhập ChatGPT → tự động lưu token. Sau đó dùng bình thường:
+
+```bash
+ctf ./my-challenge --model gpt-4o
+```
+
+Token hết hạn sẽ tự refresh. Để xóa: `ctf logout`.
+
+### Chế độ 2 — Anthropic API key
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-### Dùng OpenAI-compatible (vLLM, LiteLLM, proxy...)
+### Chế độ 3 — OpenAI API key
 
 ```bash
-export OPENAI_BASE_URL="https://your-proxy.example.com"
-export OPENAI_API_KEY="your-key"
+export OPENAI_API_KEY="sk-..."
 ```
 
-Khi `OPENAI_BASE_URL` được set, tool tự động chuyển sang chế độ OpenAI.
+### Chế độ 4 — Custom endpoint (Gemini, Groq, vLLM, LiteLLM...)
+
+```bash
+# Gemini qua Google AI Studio (miễn phí, lấy key tại aistudio.google.com/apikey)
+export OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+export OPENAI_API_KEY="AIza..."
+
+# Groq (miễn phí, nhanh)
+export OPENAI_BASE_URL="https://api.groq.com/openai"
+export OPENAI_API_KEY="gsk_..."
+
+# Local vLLM / Ollama
+export OPENAI_BASE_URL="http://localhost:8000"
+export OPENAI_API_KEY="dummy"
+```
+
+File `crates/ctf-cli/litellm_config.yaml` là ví dụ config LiteLLM proxy — dùng nếu muốn routing nhiều model qua một endpoint.
 
 ---
 
-## Cách dùng
+## Startup wizard
 
-### Cú pháp cơ bản
+Mỗi khi chạy `ctf <challenge>`, tool hiện wizard 4 bước:
 
 ```
-ctf [OPTIONS] --challenge <thư_mục>
+ ╭──────────────────────────────────────────────────────╮
+ │   ⚡  CTF Solver  v0.1.0                              │
+ ╰──────────────────────────────────────────────────────╯
+
+   Challenge   heap-overflow
+   Directory   /home/user/ctf/heap-overflow
+   Files       2 file(s)
+   ⚠  The agent will have full read/write access to this directory.
+
+  Allow? [y]/n:                         ← Bước 1: xác nhận workspace
+
+  Category detected:  💥  pwn           ← Bước 2: xác nhận / đổi category
+  Category [pwn] (Enter to confirm, type to change):
+
+  Flag format not set — choose:         ← Bước 3: chọn flag format
+    1)  FLAG{...}
+    2)  picoCTF{...}
+    3)  HTB{...}
+    ...
+  Flag format [1]:
+
+  API mode:                             ← Bước 4: chọn backend
+    1)  OpenAI / ChatGPT account  (OAuth — no key needed)
+    2)  API key  (Anthropic · OpenAI · custom endpoint)
+  Mode [1]:
+```
+
+**Hành vi:**
+- Bước 2 bị skip nếu `category.txt` đã tồn tại hoặc `--category` được truyền
+- Bước 3 bị skip nếu `flag_format.txt` đã tồn tại — lần chọn đầu tiên tự lưu lại
+- Bước 4 bị skip nếu `--api` được truyền
+- Danh sách flag format chỉnh sửa tại `~/.config/ctf-solver/flag-formats.txt`
+
+---
+
+## Cú pháp
+
+```
+ctf <challenge-dir> [OPTIONS]
+ctf login          # đăng nhập OpenAI OAuth (ChatGPT account)
+ctf logout         # xóa OpenAI credentials
 ```
 
 ### Options
 
 | Flag | Mô tả |
 |------|-------|
-| `--challenge <dir>`, `-c <dir>` | Thư mục chứa challenge (bắt buộc) |
-| `--model <name>`, `-m <name>` | Model LLM (mặc định: `claude-opus-4-6`) |
-| `--category <cat>` | Ghi đè category (`pwn`, `rev`, `web`, `crypto`, `forensics`, `misc`, `osint`) |
-| `--api openai\|anthropic` | Chọn backend API thủ công |
+| `--challenge <dir>`, `-c <dir>` | Thư mục challenge (bắt buộc) |
+| `--model <name>`, `-m <name>` | Model (mặc định: `claude-opus-4-6`) |
+| `--category <cat>` | Override category (`pwn` `web` `crypto` `rev` `forensics` `misc` `osint` `network`) |
+| `--api openai\|anthropic` | Chọn backend API thủ công, bỏ qua wizard |
 | `--resume <file>`, `-r <file>` | Resume session từ file cụ thể |
-| `--notify`, `-n` | Bật desktop notification khi agent xong |
+| `--notify`, `-n` | Bật desktop notification + âm thanh khi agent xong |
 | `--help`, `-h` | Hiện trợ giúp |
 | `--version`, `-V` | Hiện version |
 
 ### Model aliases
 
-| Alias | Model thực |
-|-------|-----------|
+| Alias | Model |
+|-------|-------|
 | `opus` | claude-opus-4-6 |
 | `sonnet` | claude-sonnet-4-6 |
 | `haiku` | claude-haiku-4-5-20251001 |
-
----
-
-## Ví dụ
-
-```bash
-# Giải challenge pwn với Claude (auto-detect từ file ELF)
-ctf --challenge ~/ctf/bksec/pwn/vuln
-
-# Chỉ định category và model
-ctf --challenge ~/ctf/web/sqli --category web --model sonnet
-
-# Dùng OpenAI proxy (ví dụ Gemini qua LiteLLM)
-OPENAI_BASE_URL=https://proxy.example.com \
-OPENAI_API_KEY=sk-xxx \
-ctf --challenge ~/ctf/rev/crackme --api openai --model gemini-2.5-pro
-
-# Bật notification + resume session cũ
-ctf --notify --challenge ~/ctf/crypto/aes --resume ~/ctf/crypto/aes/.ctf-session.json
-```
-
----
-
-## Lệnh trong session
-
-Gõ trong prompt `[category] >` khi đang chạy:
-
-| Lệnh | Mô tả |
-|------|-------|
-| `/hint` | Để agent tự bắt đầu hoặc gợi ý tiếp |
-| `/submit <flag>` | Kiểm tra flag |
-| `/notes` | Xem ghi chú challenge |
-| `/files` | Liệt kê file trong `files/` |
-| `/status` | Thống kê token, số messages |
-| `/cost` | Ước tính chi phí API |
-| `/compact` | Nén session (giải phóng token) |
-| `/reset` | Xoá toàn bộ lịch sử, bắt đầu lại |
-| `/category <cat>` | Đổi category đang active |
-| `/notify` | Bật/tắt desktop notification |
-| `/export` | Export lịch sử chat ra file text |
-| `/help` | Hiện danh sách lệnh |
-| `/exit`, `/quit` | Lưu session và thoát |
-| `Ctrl+O` | Xem toàn bộ lịch sử session |
-| `Ctrl+C` | Dừng agent đang chạy, quay về prompt |
-| `Ctrl+D` | Thoát |
+| Tên khác | dùng nguyên, ví dụ `gpt-4o`, `gemini-2.5-flash` |
 
 ---
 
 ## Cấu trúc thư mục challenge
 
-Tool tự tạo nếu chưa có:
+Tool tự tạo các thư mục khi khởi chạy:
 
 ```
 my-challenge/
-├── files/          ← để file challenge vào đây (binary, pcap, ảnh...)
-├── notes.md        ← ghi chú tự động, agent có thể ghi vào
-└── .ctf-session.json  ← session được auto-save (resume tự động)
+├── files/              ← BẮT BUỘC: để file challenge vào đây
+├── tmp/                ← agent dùng cho file tạm (không phải /tmp hệ thống)
+├── self/               ← ghi chú riêng của bạn, agent KHÔNG đọc/ghi
+├── desc.txt            ← mô tả challenge (tuỳ chọn)
+├── category.txt        ← override category (tuỳ chọn)
+├── flag_format.txt     ← ví dụ: picoCTF{...}
+├── notes.md            ← agent tự tạo và ghi findings
+├── writeup.md          ← tạo bởi lệnh /writeup
+└── .ctf-session.json   ← session auto-save (resume tự động)
+```
+
+> Khi gõ `ctf .`, tool tự detect tên thư mục thật (không để là `.`).
+
+---
+
+## Slash commands trong REPL
+
+| Lệnh | Mô tả |
+|------|-------|
+| `/hint` | Để agent tự bắt đầu (session mới) hoặc xin gợi ý tiếp |
+| `/submit <flag>` | Kiểm tra format flag trước khi submit |
+| `/notes` | Xem `notes.md` |
+| `/files` | Liệt kê file trong `files/` kèm size |
+| `/writeup` | Agent tự viết writeup chi tiết → lưu vào `writeup.md` |
+| `/status` | Thống kê token, turns, model |
+| `/cost` | Token usage chi tiết (input/output/cache) |
+| `/compact` | Force-compact session để giải phóng token |
+| `/reset` | Xóa toàn bộ session, giữ challenge context |
+| `/category <cat>` | Đổi category đang active |
+| `/notify` | Bật/tắt notification + âm thanh |
+| `/export [path]` | Export transcript ra file text |
+| `/help` | Hiện danh sách lệnh |
+| `/exit`, `/quit` | Lưu session và thoát |
+
+**Phím tắt:**
+
+| Phím | Chức năng |
+|------|-----------|
+| `Tab` | Autocomplete slash command |
+| `↑` / `↓` | Lịch sử prompt |
+| `Ctrl+O` | Xem toàn bộ lịch sử session |
+| `Ctrl+C` | Dừng agent đang chạy, quay về REPL |
+| `Ctrl+D` | Thoát |
+
+---
+
+## Notification và âm thanh
+
+Bật với `--notify` / `-n` hoặc gõ `/notify` trong REPL.
+
+Khi agent hoàn thành một turn:
+- Desktop notification qua `notify-send`
+- Âm thanh — tự detect sound file từ hệ thống lần đầu
+
+Thay đổi âm thanh tại `~/.config/ctf-solver/sound.txt`:
+
+```bash
+# Xem file được chọn tự động
+cat ~/.config/ctf-solver/sound.txt
+
+# Đổi sang file khác (hỗ trợ wav, ogg, mp3, flac...)
+echo "/path/to/sound.wav" > ~/.config/ctf-solver/sound.txt
+
+# Tắt âm thanh
+echo "none" > ~/.config/ctf-solver/sound.txt
 ```
 
 ---
 
-## Session & Resume
+## Config files
 
-- Session được **tự động save** sau mỗi lượt.
-- Lần sau chạy lại cùng thư mục → tự động resume:
-  ```bash
-  ctf --challenge ~/ctf/pwn/vuln   # tiếp tục từ lần trước
-  ```
-- Muốn bắt đầu lại từ đầu: `/reset` hoặc xoá `.ctf-session.json`.
+Tất cả config người dùng lưu tại `~/.config/ctf-solver/`:
+
+| File | Mô tả |
+|------|-------|
+| `flag-formats.txt` | Danh sách flag format (mỗi dòng một format, `#` là comment) |
+| `sound.txt` | Đường dẫn sound file (`none` để tắt) |
+| `openai-credentials.json` | OAuth token từ `ctf login` |
+
+---
+
+## Session
+
+- Session được **tự động save** sau mỗi lượt agent
+- Chạy lại cùng thư mục → tự động resume session cũ
+- Bắt đầu lại từ đầu: `/reset` trong REPL, hoặc xóa `.ctf-session.json`
 
 ---
 
@@ -151,7 +270,8 @@ my-challenge/
 | Biến | Mô tả |
 |------|-------|
 | `ANTHROPIC_API_KEY` | API key Anthropic |
-| `ANTHROPIC_BASE_URL` | Custom base URL cho Anthropic API |
+| `ANTHROPIC_BASE_URL` | Custom base URL cho Anthropic / LiteLLM proxy |
+| `OPENAI_API_KEY` | API key OpenAI hoặc provider khác |
 | `OPENAI_BASE_URL` | Base URL cho OpenAI-compatible server |
-| `OPENAI_API_KEY` | API key cho OpenAI-compatible server |
-| `ANTHROPIC_MAX_TOKENS` | Override max tokens (mặc định 8192 cho non-Claude models) |
+| `ANTHROPIC_MAX_TOKENS` | Override max tokens (mặc định tự detect theo model) |
+| `CTF_SKILLS_DIR` | Override path đến ctf-skills repo (mặc định `~/.local/share/ctf-skills`) |
