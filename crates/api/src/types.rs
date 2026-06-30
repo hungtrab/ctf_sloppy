@@ -135,15 +135,29 @@ pub enum OutputContentBlock {
         name: String,
         input: Value,
     },
+    /// Extended thinking block (reasoning models).
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// Encrypted/redacted extended thinking block.
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    #[serde(default)]
     pub input_tokens: u32,
     #[serde(default)]
     pub cache_creation_input_tokens: u32,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    #[serde(default)]
     pub output_tokens: u32,
 }
 
@@ -188,12 +202,20 @@ pub struct ContentBlockDeltaEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockDelta {
-    TextDelta { text: String },
-    InputJsonDelta { partial_json: String },
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
     /// Extended thinking delta (reasoning models like deepseek-r1)
-    ThinkingDelta { thinking: String },
+    ThinkingDelta {
+        thinking: String,
+    },
     /// Signature for thinking blocks — safe to ignore
-    SignatureDelta { signature: String },
+    SignatureDelta {
+        signature: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,4 +235,20 @@ pub enum StreamEvent {
     ContentBlockDelta(ContentBlockDeltaEvent),
     ContentBlockStop(ContentBlockStopEvent),
     MessageStop(MessageStopEvent),
+    /// Sent mid-stream by Anthropic (and compatible proxies) when something
+    /// goes wrong after the response has already started, e.g.
+    /// `overloaded_error` or `rate_limit_error`.
+    Error(StreamErrorEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamErrorEvent {
+    pub error: StreamErrorDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamErrorDetail {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
 }

@@ -27,6 +27,13 @@ pub enum ApiError {
         attempt: u32,
         base_delay: Duration,
     },
+    /// A mid-stream `event: error` frame (e.g. `overloaded_error`,
+    /// `rate_limit_error`) sent after the response has already started.
+    Stream {
+        error_type: String,
+        message: String,
+        retryable: bool,
+    },
 }
 
 impl ApiError {
@@ -34,7 +41,7 @@ impl ApiError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
-            Self::Api { retryable, .. } => *retryable,
+            Self::Api { retryable, .. } | Self::Stream { retryable, .. } => *retryable,
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingApiKey
             | Self::ExpiredOAuthToken
@@ -96,6 +103,11 @@ impl Display for ApiError {
                 "anthropic api failed after {attempts} attempts: {last_error}"
             ),
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
+            Self::Stream {
+                error_type,
+                message,
+                ..
+            } => write!(f, "anthropic api stream error ({error_type}): {message}"),
             Self::BackoffOverflow {
                 attempt,
                 base_delay,

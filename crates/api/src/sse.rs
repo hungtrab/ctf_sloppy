@@ -95,9 +95,27 @@ pub fn parse_frame(frame: &str) -> Result<Option<StreamEvent>, ApiError> {
         return Ok(None);
     }
 
-    serde_json::from_str::<StreamEvent>(&payload)
-        .map(Some)
-        .map_err(ApiError::from)
+    let event = serde_json::from_str::<StreamEvent>(&payload).map_err(ApiError::from)?;
+
+    if let StreamEvent::Error(error) = event {
+        let error_type = error.error.error_type;
+        let retryable = matches!(
+            error_type.as_str(),
+            "overloaded_error"
+                | "rate_limit_error"
+                | "api_error"
+                | "timeout_error"
+                | "upstream_error"
+                | "stream_timeout"
+        );
+        return Err(ApiError::Stream {
+            error_type,
+            message: error.error.message,
+            retryable,
+        });
+    }
+
+    Ok(Some(event))
 }
 
 #[cfg(test)]

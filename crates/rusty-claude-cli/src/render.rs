@@ -28,44 +28,18 @@ pub struct ColorTheme {
 
 impl Default for ColorTheme {
     fn default() -> Self {
-        // Everforest palette — matches feynman's Pi theme (.feynman/themes/feynman.json).
-        let ink = Color::Rgb {
-            r: 211,
-            g: 198,
-            b: 170,
-        }; // text
-        let stone = Color::Rgb {
-            r: 157,
-            g: 169,
-            b: 160,
-        }; // muted/border
-        let sage = Color::Rgb {
-            r: 167,
-            g: 192,
-            b: 128,
-        }; // accent/success/heading
-        let teal = Color::Rgb {
-            r: 127,
-            g: 187,
-            b: 179,
-        }; // link/inline code
-        let rose = Color::Rgb {
-            r: 230,
-            g: 126,
-            b: 128,
-        }; // error
         Self {
-            heading: sage,
-            emphasis: stone,
-            strong: ink,
-            inline_code: teal,
-            link: teal,
-            quote: stone,
-            table_border: stone,
-            code_block_border: stone,
-            spinner_active: teal,
-            spinner_done: sage,
-            spinner_failed: rose,
+            heading: Color::Cyan,
+            emphasis: Color::Magenta,
+            strong: Color::Yellow,
+            inline_code: Color::Green,
+            link: Color::Blue,
+            quote: Color::DarkGrey,
+            table_border: Color::DarkCyan,
+            code_block_border: Color::DarkGrey,
+            spinner_active: Color::Blue,
+            spinner_done: Color::Green,
+            spinner_failed: Color::Red,
         }
     }
 }
@@ -207,9 +181,9 @@ impl RenderState {
         if let Some(level) = self.heading_level {
             style = match level {
                 1 => style.with(theme.heading),
-                2 => style.with(theme.strong),
-                3 => style.with(theme.link),
-                _ => style.with(theme.quote),
+                2 => style.white(),
+                3 => style.with(Color::Blue),
+                _ => style.with(Color::Grey),
             };
         } else if self.strong > 0 {
             style = style.with(theme.strong);
@@ -612,12 +586,10 @@ impl TerminalRenderer {
         colored_output
     }
 
-    // Streaming markdown helper; kept for callers that render incrementally.
-    #[allow(dead_code)]
     pub fn stream_markdown(&self, markdown: &str, out: &mut impl Write) -> io::Result<()> {
-        let rendered = self.markdown_to_ansi(markdown);
-        write!(out, "{rendered}")?;
-        if !rendered.ends_with('\n') {
+        let rendered_markdown = self.markdown_to_ansi(markdown);
+        write!(out, "{rendered_markdown}")?;
+        if !rendered_markdown.ends_with('\n') {
             writeln!(out)?;
         }
         out.flush()
@@ -694,82 +666,6 @@ fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
 
 fn visible_width(input: &str) -> usize {
     strip_ansi(input).chars().count()
-}
-
-#[allow(dead_code)]
-pub fn terminal_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(w, _)| w as usize)
-        .unwrap_or(100)
-        .max(40)
-}
-
-/// Word-wrap ANSI-coloured text to `max_width` columns.
-/// Code blocks (lines inside fenced code blocks) are never wrapped.
-#[allow(dead_code)]
-pub fn word_wrap_ansi(text: &str, max_width: usize) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_fence = false;
-
-    for line in text.split('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        if in_fence {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-
-        // Measure visible width; if it fits, keep as-is
-        if visible_width(line) <= max_width {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-
-        // Wrap at word boundaries, preserving leading indent + ANSI prefix
-        let indent: String = line.chars().take_while(|c| *c == ' ').collect();
-        let indent_width = indent.len();
-        let wrap_at = max_width.saturating_sub(indent_width).max(20);
-
-        // Collect "words" (split on spaces, keep ANSI intact)
-        let visible = strip_ansi(line.trim_start());
-        let words: Vec<&str> = visible.split_whitespace().collect();
-        let mut current_line = indent.clone();
-        let mut current_width = indent_width;
-
-        for word in words {
-            let word_len = word.chars().count();
-            if current_width > indent_width && current_width + 1 + word_len > wrap_at + indent_width
-            {
-                out.push_str(current_line.trim_end());
-                out.push('\n');
-                current_line.clone_from(&indent);
-                current_width = indent_width;
-            }
-            if current_width > indent_width {
-                current_line.push(' ');
-                current_width += 1;
-            }
-            current_line.push_str(word);
-            current_width += word_len;
-        }
-        if !current_line.trim().is_empty() {
-            out.push_str(current_line.trim_end());
-            out.push('\n');
-        }
-    }
-
-    // Remove trailing extra newline added by the loop
-    if out.ends_with('\n') && !text.ends_with('\n') {
-        out.pop();
-    }
-    out
 }
 
 fn strip_ansi(input: &str) -> String {

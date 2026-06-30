@@ -75,7 +75,6 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-
         let child = child.spawn()?;
 
         return Ok(BashCommandOutput {
