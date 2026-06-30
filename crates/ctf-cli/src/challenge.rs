@@ -11,6 +11,10 @@ pub enum Category {
     Misc,
     Osint,
     Network,
+    MlAi,
+    Game,
+    Quantum,
+    Blockchain,
 }
 
 impl Category {
@@ -24,6 +28,10 @@ impl Category {
             Self::Misc => "misc",
             Self::Osint => "osint",
             Self::Network => "network",
+            Self::MlAi => "ml_ai",
+            Self::Game => "game",
+            Self::Quantum => "quantum",
+            Self::Blockchain => "blockchain",
         }
     }
 
@@ -37,6 +45,13 @@ impl Category {
             "misc" | "miscellaneous" | "other" => Some(Self::Misc),
             "osint" => Some(Self::Osint),
             "network" | "net" | "networking" | "pcap" => Some(Self::Network),
+            "ml_ai" | "ml" | "ai" | "ml-ai" | "machine-learning" | "machine_learning" | "aiml" => {
+                Some(Self::MlAi)
+            }
+            "game" | "gamehacking" | "game-hacking" | "game_hacking" | "gaming" => Some(Self::Game),
+            "quantum" | "quantum-computing" | "quantum_computing" | "qc" => Some(Self::Quantum),
+            "blockchain" | "smart-contract" | "smart_contract" | "web3" | "solidity"
+            | "crypto-currency" => Some(Self::Blockchain),
             _ => None,
         }
     }
@@ -52,6 +67,10 @@ impl Category {
             Self::Misc => "🎲",
             Self::Osint => "👁",
             Self::Network => "📡",
+            Self::MlAi => "🤖",
+            Self::Game => "🎮",
+            Self::Quantum => "⚛️",
+            Self::Blockchain => "⛓️",
         }
     }
 }
@@ -70,7 +89,7 @@ impl Challenge {
     /// Expected layout:
     ///   <dir>/
     ///     files/          ← challenge binaries/sources/pcaps
-    ///     description.txt ← challenge text (optional)
+    ///     desc.txt        ← challenge text (optional)
     ///     category.txt    ← single word category (optional)
     ///     flag_format.txt ← e.g. "picoCTF{...}" (optional)
     pub fn load(dir: &Path) -> Self {
@@ -80,8 +99,10 @@ impl Challenge {
             .as_deref()
             .and_then(|p| p.file_name())
             .or_else(|| dir.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "challenge".to_string());
+            .map_or_else(
+                || "challenge".to_string(),
+                |n| n.to_string_lossy().to_string(),
+            );
 
         let description = fs::read_to_string(dir.join("desc.txt"))
             .unwrap_or_default()
@@ -95,7 +116,13 @@ impl Challenge {
 
         let category = Self::detect_category(dir, &description);
 
-        Challenge { name, dir: dir.to_path_buf(), category, flag_format, description }
+        Challenge {
+            name,
+            dir: dir.to_path_buf(),
+            category,
+            flag_format,
+            description,
+        }
     }
 
     pub fn with_category(mut self, category: Category) -> Self {
@@ -116,36 +143,114 @@ impl Challenge {
         let extensions = collect_extensions(&files_dir);
         let has_elf = has_elf_binary(&files_dir);
 
-        if extensions.iter().any(|e| matches!(e.as_str(), "pcap" | "pcapng" | "cap")) {
+        if extensions
+            .iter()
+            .any(|e| matches!(e.as_str(), "pcap" | "pcapng" | "cap"))
+        {
             return Category::Network;
         }
-        if extensions.iter().any(|e| matches!(e.as_str(), "apk" | "jar" | "class" | "dex")) {
+        if extensions
+            .iter()
+            .any(|e| matches!(e.as_str(), "apk" | "jar" | "class" | "dex"))
+        {
             return Category::Rev;
+        }
+        if extensions.iter().any(|e| {
+            matches!(
+                e.as_str(),
+                "h5" | "pt" | "pth" | "onnx" | "pb" | "ckpt" | "safetensors"
+            )
+        }) {
+            return Category::MlAi;
+        }
+        if extensions
+            .iter()
+            .any(|e| matches!(e.as_str(), "sol" | "vy"))
+        {
+            return Category::Blockchain;
         }
         // 3. Description keywords
         let desc = description.to_lowercase();
-        if desc.contains("overflow") || desc.contains("heap") || desc.contains("rop")
-            || desc.contains("shellcode") || desc.contains("stack smash")
+        if desc.contains("overflow")
+            || desc.contains("heap")
+            || desc.contains("rop")
+            || desc.contains("shellcode")
+            || desc.contains("stack smash")
         {
             return Category::Pwn;
         }
-        if desc.contains("sql injection") || desc.contains("xss") || desc.contains("lfi")
-            || desc.contains("ssrf") || desc.contains("csrf") || desc.contains("http")
-            || desc.contains("cookie") || desc.contains("web server")
+        if desc.contains("smart contract")
+            || desc.contains("solidity")
+            || desc.contains("ethereum")
+            || desc.contains("evm")
+            || desc.contains("blockchain")
+            || desc.contains("erc20")
+            || desc.contains("erc721")
+            || desc.contains("web3")
+        {
+            return Category::Blockchain;
+        }
+        if desc.contains("qubit")
+            || desc.contains("quantum circuit")
+            || desc.contains("quantum gate")
+            || desc.contains("qiskit")
+            || desc.contains("shor's algorithm")
+            || desc.contains("grover")
+        {
+            return Category::Quantum;
+        }
+        if desc.contains("neural network")
+            || desc.contains("model weights")
+            || desc.contains("adversarial")
+            || desc.contains("pytorch")
+            || desc.contains("tensorflow")
+            || desc.contains("llm prompt")
+            || desc.contains("prompt injection")
+            || desc.contains("jailbreak the model")
+        {
+            return Category::MlAi;
+        }
+        if desc.contains("save file")
+            || desc.contains("game hacking")
+            || desc.contains("cheat engine")
+            || desc.contains("unity")
+            || desc.contains("unreal engine")
+            || desc.contains("godot")
+            || desc.contains("emulator")
+            || desc.contains("rom hack")
+        {
+            return Category::Game;
+        }
+        if desc.contains("sql injection")
+            || desc.contains("xss")
+            || desc.contains("lfi")
+            || desc.contains("ssrf")
+            || desc.contains("csrf")
+            || desc.contains("http")
+            || desc.contains("cookie")
+            || desc.contains("web server")
         {
             return Category::Web;
         }
-        if desc.contains("rsa") || desc.contains("aes") || desc.contains("cipher")
-            || desc.contains("encrypt") || desc.contains("decrypt") || desc.contains("hash")
-            || desc.contains("modular") || desc.contains("prime")
+        if desc.contains("rsa")
+            || desc.contains("aes")
+            || desc.contains("cipher")
+            || desc.contains("encrypt")
+            || desc.contains("decrypt")
+            || desc.contains("hash")
+            || desc.contains("modular")
+            || desc.contains("prime")
         {
             return Category::Crypto;
         }
         if desc.contains("reverse") || desc.contains("disassem") || desc.contains("decompil") {
             return Category::Rev;
         }
-        if desc.contains("steganograph") || desc.contains("forensic") || desc.contains("memory dump")
-            || desc.contains("volatility") || desc.contains("wireshark")
+        if desc.contains("steganograph")
+            || desc.contains("forensic")
+            || desc.contains("memory dump")
+            || desc.contains("volatility")
+            || desc.contains("wireshark")
         {
             return Category::Forensics;
         }
@@ -167,7 +272,7 @@ fn collect_extensions(dir: &Path) -> Vec<String> {
         return Vec::new();
     };
     entries
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter_map(|e| {
             e.path()
                 .extension()
@@ -180,7 +285,7 @@ fn has_elf_binary(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return false;
     };
-    for entry in entries.filter_map(|e| e.ok()) {
+    for entry in entries.filter_map(std::result::Result::ok) {
         let path = entry.path();
         if path.is_file() {
             if let Ok(mut file) = fs::File::open(&path) {

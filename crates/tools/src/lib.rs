@@ -1736,6 +1736,9 @@ impl ApiClient for AnthropicRuntimeClient {
                         saw_stop = true;
                         events.push(AssistantEvent::MessageStop);
                     }
+                    // Converted into an `Err` by `SseParser`/`parse_frame` before
+                    // it ever reaches `next_event`'s `Ok(Some(_))` path.
+                    ApiStreamEvent::Error(_) => unreachable!("stream errors are surfaced as Err"),
                 }
             }
 
@@ -1862,6 +1865,7 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
+        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
     }
 }
 

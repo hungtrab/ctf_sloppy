@@ -761,7 +761,7 @@ mod tests {
             "post hook should preserve non-error result: {output:?}"
         );
         assert!(
-            output.contains("4"),
+            output.contains('4'),
             "tool output missing value: {output:?}"
         );
         assert!(

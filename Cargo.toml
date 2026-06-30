@@ -17,3 +17,21 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_panics_doc = "allow"
 missing_errors_doc = "allow"
+# High-volume style lints with low signal for this CLI: building display
+# strings by appending `format!`, long top-level command/render functions, and
+# wide constructor/render signatures. Allowed deliberately to keep the
+# `-D warnings` gate focused on correctness lints.
+format_push_string = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+# Numeric casts in terminal-width / score-ranking / timestamp math where the
+# values are bounded and the precision/truncation is benign.
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+# Owned args passed to render/format helpers; making them borrow churns call
+# sites for no correctness gain.
+needless_pass_by_value = "allow"
+# Render/helper methods kept as methods for call-site ergonomics even when they
+# don't currently read `self`.
+unused_self = "allow"
