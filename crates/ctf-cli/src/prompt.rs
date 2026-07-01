@@ -660,17 +660,39 @@ fn category_guide(cat: Category) -> String {
     3. RSA attacks: Wiener (small d), Hastad broadcast, Franklin-Reiter, Fermat factoring
     4. Python for everything: from Crypto.Util.number import *, sympy.factorint, etc.
     5. Decode layers: base64 → hex → XOR → caesar as needed
-  Useful one-liner: python3 -c "import base64; print(base64.b64decode('<data>'))"  "#.to_string(),
+  Useful one-liner: python3 -c "import base64; print(base64.b64decode('<data>'))"
+  Pitfalls (from real solve failures — read carefully):
+    - Classical ciphers (Caesar/ROT/Vigenere/substitution): apply the shift to the ENTIRE
+      ciphertext body and submit the FULL result. The flag often ends in random-looking
+      characters — do NOT trim to the part that reads like English words. e.g. if a Caesar
+      decrypt gives "crossingtherubiconxyzq", the flag is the whole thing, not "crossingtherubicon".
+    - Before brute-forcing, ESTIMATE the search space. More than ~10^8 candidates is infeasible
+      in Python within the time limit — look for algebraic structure, invariants, or extra
+      constraints to shrink it, rather than looping over everything blindly.
+    - Self-contained challenges (hardcoded ciphertext in the file) are solved by RUNNING your own
+      script in the REPL and reading its printed output. Never declare a flag you have not actually
+      computed — a plausible-looking guess is almost always wrong."#.to_string(),
 
         Category::Rev => r"CATEGORY: REVERSE ENGINEERING
-  Available: file, strings, objdump, nm, ltrace, strace, radare2 (r2), ghidra (headless)
-  Standard workflow:
-    1. file <binary>              → type (ELF/PE/script/bytecode)
-    2. strings <binary> | grep -i flag  → quick win check
-    3. ltrace/strace ./binary     → see library calls and syscalls live
-    4. objdump -d <binary>        → disassemble
-    5. r2 -A <binary>; afl; pdf @ main  → radare2 analysis
-    6. Dynamic: gdb + break on strcmp/memcmp to catch flag comparison
+  Available: challenge_recon, binary_recon, decompile (built-in tools); file, strings, objdump,
+             nm, radare2 (r2), gdb. (ltrace is often NOT installed — do not rely on it.)
+  Standard workflow — prefer the built-in tools, they give more per call:
+    1. challenge_recon            → list & fingerprint files first
+    2. binary_recon <path>        → ONE call gives file type, security flags, linked libs, strings,
+                                     imports (libc calls that reveal logic), AND radare2 disassembly
+                                     of main/entry0 + the recovered function list. Works on STRIPPED
+                                     binaries. READ this disassembly before doing anything else.
+    3. decompile <path> <func>    → pseudocode for a specific function (use a name/addr from
+                                     binary_recon's function list, e.g. the largest fcn = likely main)
+    4. grep_search for flag-shaped strings; gdb break on strcmp/memcmp for dynamic capture
+  Pitfalls (from real solve failures — read carefully):
+    - Do the actual RE: read the disassembly / decompilation of the check function. `strings|grep flag`
+      failing does NOT mean 'no flag' — most flags are computed, not stored as plaintext.
+    - LARGE source/data files (>~50KB, e.g. big .lua/.js/firmware): NEVER read the whole file — it
+      overflows the context window and derails the run. Use grep_search or read a targeted line range
+      to locate the check/flag logic.
+    - When the flag is assembled from character-index checks (charAt(i)=='x'), reconstruct the
+      COMPLETE string across ALL indices in order — do not submit a partial/reordered guess.
   Look for: hardcoded strings, XOR loops, custom hash functions, anti-debug tricks".to_string(),
 
         Category::Forensics => r"CATEGORY: DIGITAL FORENSICS
