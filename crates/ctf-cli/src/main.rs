@@ -1731,10 +1731,20 @@ impl CtfCli {
         // ── No prompter = zero approval dialogs ──────────────────────────────
         let mut result = self.runtime.run_turn(input, None);
 
-        // 413 / 524 → session too large; compact and retry with notes injected
+        // Session too large for the model's context window → compact and retry.
+        // 413/524: proxy/gateway limits. `exceed_context_size` / "exceeds the
+        // available context": llama.cpp (local models) rejecting a request that
+        // outgrew its `-c` window — common on small-context local servers once
+        // the base prompt + accumulated turns pass the limit. Without this, the
+        // agent hammers the same over-limit request every turn and the whole run
+        // dies (observed: a 286KB-file rev challenge failing 20 turns straight).
         if let Err(ref e) = result {
             let emsg = e.to_string();
-            if emsg.contains("413") || emsg.contains("524") {
+            if emsg.contains("413")
+                || emsg.contains("524")
+                || emsg.contains("exceed_context_size")
+                || emsg.contains("exceeds the available context")
+            {
                 spinner.tick(
                     "⚡ context too large — compacting session and retrying...",
                     TerminalRenderer::new().color_theme(),
