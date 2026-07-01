@@ -264,8 +264,10 @@ fn max_tokens_for_model(model: &str) -> u32 {
     if model.starts_with("gpt-4") {
         return 16_384;
     }
-    // Local/vLLM/Ollama — conservative default
-    8_192
+    // Local/vLLM/Ollama (incl. reasoning models served via llama.cpp): give
+    // enough headroom that a long chain-of-thought can finish and still emit a
+    // final answer / tool call, instead of being truncated with empty content.
+    16_384
 }
 
 /// Returns true for models that:
@@ -551,28 +553,6 @@ fn default_plan_model(model: &str) -> String {
     }
     // Already cheap, local, or unknown → use same
     model.to_string()
-}
-
-/// Prepend notes.md content to the input so the agent resumes with full context.
-/// Concatenated text blocks of the most recent assistant message in the session.
-fn last_assistant_text(runtime: &ConversationRuntime<CtfApiClient, CtfToolExecutor>) -> String {
-    runtime
-        .session()
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == MessageRole::Assistant)
-        .map(|m| {
-            m.blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
 }
 
 fn session_has_tool_results(runtime: &ConversationRuntime<CtfApiClient, CtfToolExecutor>) -> bool {
@@ -1668,106 +1648,23 @@ impl CtfCli {
         }
     }
 
-    /// Given a candidate flag the agent just declared with "FLAG: <value>",
-    /// run an extra verification turn requiring the agent to dynamically
-    /// confirm it (not just static analysis / decoy strings). If verified,
-    /// record it (banner, notes.md, KB auto-capture) and return true.
-    /// Otherwise print a warning and return false so the caller can keep working.
+    /// Record a flag the agent declared with "FLAG: <value>".
+    ///
+    /// There is intentionally no in-agent "verification" round: the real judge
+    /// is the platform / checker (`CTFd`, nc service, web form) or, for offline
+    /// benchmarks, the ground-truth scorer — not the model re-checking its own
+    /// work. The old self-verification ceremony wasted turns and produced both
+    /// false negatives (rejecting a correct, statically-derived flag) and false
+    /// positives (accepting a wrong flag the model "confirmed" with a buggy
+    /// solver). So we accept the declared candidate, record it, and let the
+    /// external oracle decide correctness.
+    // Result is retained so a future real-checker submission (CTFd/nc) can
+    // propagate errors; today it always succeeds.
+    #[allow(clippy::unnecessary_wraps)]
     fn verify_and_record_flag(
         &mut self,
         candidate: &str,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        println!(
-            "\n{C_TEAL}🔎 Candidate flag declared: {candidate} — verifying before accepting…{C_RESET}\n"
-        );
-
-        let verify_prompt = format!(
-            "You declared FLAG: {candidate}. VERIFY this is the real flag — CTF binaries/files \
-             often contain decoy strings shaped exactly like flags.\n\
-             Actual challenge files:\n{files_manifest}\n\
-             Small text-file preview:\n{files_preview}\n\
-             You are in the challenge root directory. Use paths from the manifest, usually \
-             ./files/<name>; do not invent a filename from the challenge name unless it is listed.\n\
-             Internal harness files are not challenge evidence: do not use .ctf-session.json, \
-             notes.md, writeup.md, logs/, or logs/replay.sh to verify a flag. If grepping \
-             recursively, search ./files or exclude those internal paths.\n\
-             Before answering, use exactly one available tool (bash/REPL/checker/etc.) to verify \
-             the candidate with execution or a reproducible computation.\n\
-             - If a checker exists (local script, remote nc service, web form), submit \
-               \"{candidate}\" and confirm it is ACCEPTED.\n\
-             - If you found this string via static analysis (strings/grep/objdump/file \
-               inspection) without running anything, you MUST execute the actual exploit \
-               or program and confirm \"{candidate}\" is the real, dynamically-produced \
-               result — not a planted decoy.\n\
-             - If verified correct, repeat it on its own line as exactly: FLAG: {candidate}\n\
-             - If it is WRONG (a decoy or doesn't validate), write \"FLAG VERIFICATION \
-               FAILED\" and continue investigating for the real flag.",
-            files_manifest = challenge_files_manifest(&self.challenge),
-            files_preview = challenge_files_preview(&self.challenge),
-        );
-
-        // Run via run_turn_impl directly (not run_turn/run_turn_no_interrupt) so a
-        // repeated "FLAG: <candidate>" in the verification reply doesn't recurse
-        // back into another verification round.
-        let before_verify_messages = self.runtime.session().messages.len();
-        self.run_turn_impl(&verify_prompt, false)?;
-
-        let verify_text = last_assistant_text(&self.runtime);
-        let mut verification_used_tool = self.runtime.session().messages[before_verify_messages..]
-            .iter()
-            .any(|message| message.role == MessageRole::Tool);
-        let mut declared_candidate = self
-            .flag_extractor
-            .scan_declared(&verify_text)
-            .is_some_and(|v| v == candidate);
-
-        if !verification_used_tool && declared_candidate {
-            println!(
-                "\n{C_STONE}⚠ Verification made a claim without tools — forcing one tool-backed check.{C_RESET}\n"
-            );
-            let retry_prompt = format!(
-                "Your previous verification did not use a tool result, so it cannot be accepted. \
-                 Now use bash or REPL first. Use real paths from this manifest:\n{files_manifest}\n\
-                 Small text-file preview:\n{files_preview}\n\
-                 Do not use .ctf-session.json, notes.md, writeup.md, logs/, or logs/replay.sh as \
-                 evidence; those are solver artifacts, not challenge files.\n\
-                 Run a minimal reproducible check for candidate {candidate}. After the tool output, \
-                 write exactly `FLAG: {candidate}` only if the output proves it; otherwise write \
-                 `FLAG VERIFICATION FAILED`.",
-                files_manifest = challenge_files_manifest(&self.challenge),
-                files_preview = challenge_files_preview(&self.challenge),
-            );
-            let before_retry_messages = self.runtime.session().messages.len();
-            self.run_turn_impl(&retry_prompt, false)?;
-            let retry_text = last_assistant_text(&self.runtime);
-            verification_used_tool = self.runtime.session().messages[before_retry_messages..]
-                .iter()
-                .any(|message| message.role == MessageRole::Tool);
-            declared_candidate = self
-                .flag_extractor
-                .scan_declared(&retry_text)
-                .is_some_and(|v| v == candidate);
-        }
-        let verified = self
-            .flag_extractor
-            .scan_declared(&last_assistant_text(&self.runtime))
-            .is_some_and(|v| v == candidate)
-            && verification_used_tool
-            && declared_candidate;
-
-        if !verified {
-            if verification_used_tool {
-                println!(
-                    "\n{C_STONE}⚠ Verification did not confirm the flag — continuing.{C_RESET}\n"
-                );
-            } else {
-                println!(
-                    "\n{C_STONE}⚠ Verification used no tools/checker — not accepting the flag yet.{C_RESET}\n"
-                );
-            }
-            return Ok(false);
-        }
-
         println!("{}", render_flag_found(candidate));
         let notes = self.challenge.dir.join("notes.md");
         let _ = fs::OpenOptions::new()
@@ -3513,6 +3410,7 @@ impl CtfApiClient {
                 let mut stream_err: Option<String> = None;
                 let mut printed_label = false;
                 let mut assistant_text = String::new();
+                let mut reasoning_text = String::new();
                 let mut fallback_tools_emitted = false;
                 let mut think_filter = ThinkFilter::default();
                 let mut thinking = Some(ThinkingSpinner::start(format!("{C_TEAL}Thinking…{C_RESET}")));
@@ -3605,6 +3503,18 @@ impl CtfApiClient {
                             }
                         }
 
+                        // Reasoning models (deepseek-style, served via llama.cpp)
+                        // stream chain-of-thought in a separate `reasoning_content`
+                        // field. Capture it so a turn that produced only reasoning
+                        // (empty `content`) can still recover its intended tool call.
+                        if let Some(rc) = delta
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .or_else(|| delta.get("reasoning").and_then(Value::as_str))
+                        {
+                            reasoning_text.push_str(rc);
+                        }
+
                         // Tool call deltas
                         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                             for tc in tool_calls {
@@ -3653,7 +3563,18 @@ impl CtfApiClient {
                                 }
                             }
                             if !has_native_tools && !fallback_tools_emitted {
-                                let fallback_tools = fallback_tool_calls_from_text(&assistant_text);
+                                let mut fallback_tools =
+                                    fallback_tool_calls_from_text(&assistant_text);
+                                // Reasoning models sometimes settle on the next
+                                // action only inside their hidden reasoning, leaving
+                                // `content` empty. Rather than burn the turn, recover
+                                // the intended call from the reasoning as a last resort.
+                                if fallback_tools.is_empty()
+                                    && assistant_text.trim().is_empty()
+                                    && !reasoning_text.trim().is_empty()
+                                {
+                                    fallback_tools = fallback_tool_calls_from_text(&reasoning_text);
+                                }
                                 for (idx, tool) in fallback_tools.into_iter().enumerate() {
                                     let display = format_ctf_tool_call(&tool.name, &tool.input);
                                     write!(stdout, "\n{display}\n")
@@ -4431,12 +4352,125 @@ fn fallback_tool_calls_from_text(text: &str) -> Vec<FallbackToolCall> {
     calls.extend(tagged_json_tool_calls(text, "tool"));
     calls.extend(tagged_json_tool_calls(text, "tool_call"));
     calls.extend(tool_code_parameter_arg_calls(text));
+    calls.extend(html_comment_tool_calls(text));
+    calls.extend(name_parameters_tool_calls(text));
     calls.extend(run_directive_tool_calls(text));
     calls.extend(invoke_tool_calls(text));
     calls.extend(fenced_tool_calls(text));
     calls.extend(natural_language_tool_calls(text));
 
     dedupe_fallback_tool_calls(calls)
+}
+
+/// Known CTF tool names — used to validate fallback-parsed calls so a malformed
+/// blob can't invent a bogus tool name that just wastes a turn on an error.
+fn is_known_ctf_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "challenge_recon"
+            | "binary_recon"
+            | "extract_archive"
+            | "grep_search"
+            | "glob_search"
+            | "read_file"
+            | "write_file"
+            | "decompile"
+            | "bash"
+            | "REPL"
+            | "kb_search"
+            | "kb_read"
+            | "kb_add"
+    )
+}
+
+/// Extract the first balanced `{...}` substring (handles nested braces and
+/// braces inside double-quoted strings). Returns the object including braces.
+fn extract_balanced_braces(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Some models hide tool calls inside an HTML comment as an action envelope,
+/// e.g. `<!-- {"action":"call_tool","tool":"bash","arguments":{...}} -->`.
+fn html_comment_tool_calls(text: &str) -> Vec<FallbackToolCall> {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        let after = &rest[start + "<!--".len()..];
+        let Some(end) = after.find("-->") else {
+            break;
+        };
+        let body = after[..end].trim();
+        rest = &after[end + "-->".len()..];
+        if let Some(call) = parse_json_tool_call(body) {
+            if is_known_ctf_tool(&call.name) {
+                calls.push(call);
+            }
+        }
+    }
+    calls
+}
+
+/// Parse `name="grep_search", parameters={...}` style bodies (seen inside
+/// `<tool_code>` blocks emitted by some models) — not valid JSON on their own,
+/// so the two fields are pulled out directly.
+fn name_parameters_tool_calls(text: &str) -> Vec<FallbackToolCall> {
+    let mut calls = Vec::new();
+    let norm = normalize_smart_quotes(text);
+    let name_re = Regex::new(r#"name\s*=\s*"([a-zA-Z_]+)""#).expect("valid name= regex");
+    for caps in name_re.captures_iter(&norm) {
+        let whole = caps.get(0).expect("match 0");
+        let name = caps.get(1).expect("group 1").as_str().to_string();
+        if !is_known_ctf_tool(&name) {
+            continue;
+        }
+        let after = &norm[whole.end()..];
+        let mut input = String::from("{}");
+        if let Some(pidx) = after.find("parameters") {
+            if let Some(obj) = extract_balanced_braces(&after[pidx..]) {
+                if let Some(value) = parse_loose_json_value(&obj) {
+                    input = normalize_tool_arguments(value);
+                }
+            }
+        }
+        if name == "challenge_recon" {
+            if input == "{}" {
+                input = json!({ "max_files": 120 }).to_string();
+            }
+        } else if input == "{}" {
+            // Arg-taking tools with no recovered parameters would just error.
+            continue;
+        }
+        calls.push(FallbackToolCall { name, input });
+    }
+    calls
 }
 
 fn natural_language_tool_calls(text: &str) -> Vec<FallbackToolCall> {
@@ -4751,10 +4785,17 @@ fn parse_json_tool_call(raw: &str) -> Option<FallbackToolCall> {
         .trim();
     let value: Value = serde_json::from_str(cleaned).ok()?;
 
-    if let Some(name) = value.get("name").and_then(Value::as_str) {
+    // Accept `name`, or the `tool` key used by `{"action":"call_tool","tool":…}`
+    // envelopes some models emit.
+    if let Some(name) = value
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("tool").and_then(Value::as_str))
+    {
         let args = value
             .get("arguments")
             .or_else(|| value.get("parameters"))
+            .or_else(|| value.get("input"))
             .cloned()
             .unwrap_or_else(|| json!({}));
         return Some(FallbackToolCall {
@@ -7962,6 +8003,44 @@ mod tests {
 
     fn think_filter_all(f: &mut ThinkFilter, chunks: &[&str]) -> String {
         chunks.iter().map(|c| f.push(c)).collect()
+    }
+
+    #[test]
+    fn parses_html_comment_action_tool_call() {
+        let calls = fallback_tool_calls_from_text(
+            r#"<!-- {"action":"call_tool","tool":"bash","arguments":{"command":"ls"}} -->"#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert!(calls[0].input.contains("\"command\""));
+    }
+
+    #[test]
+    fn parses_html_comment_challenge_recon() {
+        let calls = fallback_tool_calls_from_text(
+            r#"<!-- {"action":"call_tool","tool":"challenge_recon","arguments":{}} -->"#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "challenge_recon");
+    }
+
+    #[test]
+    fn parses_tool_code_name_parameters_body() {
+        // The exact malformed shape Qwythos emits (with curly smart quotes).
+        let calls = fallback_tool_calls_from_text(
+            "<tool_code>\nname=\u{201c}grep_search\u{201d}, parameters={\u{201c}pattern\u{201d}:\u{201c}flag\u{201d},\u{201c}path\u{201d}:\u{201c}./files\u{201d}}\n</tool_code>",
+        );
+        assert!(calls.iter().any(|c| c.name == "grep_search"
+            && c.input.contains("flag")
+            && c.input.contains("./files")));
+    }
+
+    #[test]
+    fn html_comment_rejects_unknown_tool() {
+        let calls = fallback_tool_calls_from_text(
+            r#"<!-- {"action":"call_tool","tool":"not_a_real_tool","arguments":{}} -->"#,
+        );
+        assert!(calls.is_empty());
     }
 
     #[test]
