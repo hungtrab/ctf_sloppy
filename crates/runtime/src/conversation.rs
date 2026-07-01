@@ -374,13 +374,17 @@ fn build_assistant_message(
 
     flush_text_block(&mut text, &mut blocks);
 
-    if !finished {
-        return Err(RuntimeError::new(
-            "assistant stream ended without a message stop event",
-        ));
-    }
+    // A stream can end without an explicit stop event when the server cuts the
+    // connection mid-generation or finishes with reason "length" (common with
+    // small local models that ramble up to max_tokens). As long as we captured
+    // some content, salvage the turn instead of discarding it and erroring out —
+    // only fail when nothing at all was produced.
     if blocks.is_empty() {
-        return Err(RuntimeError::new("assistant stream produced no content"));
+        return Err(RuntimeError::new(if finished {
+            "assistant stream produced no content"
+        } else {
+            "assistant stream ended without any content"
+        }));
     }
 
     Ok((

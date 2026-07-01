@@ -2401,24 +2401,30 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     })
 }
 
+#[derive(Debug)]
 struct ReplRuntime {
     program: &'static str,
     args: &'static [&'static str],
 }
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "python" | "py" => Ok(ReplRuntime {
+    // Normalise common aliases models emit (e.g. "python3", "py3", "nodejs",
+    // "zsh") so a valid REPL call is never rejected on a label technicality.
+    let lang = language.trim().to_ascii_lowercase();
+    if lang.starts_with("py") {
+        return Ok(ReplRuntime {
             program: detect_first_command(&["python3", "python"])
                 .ok_or_else(|| String::from("python runtime not found"))?,
             args: &["-c"],
-        }),
-        "javascript" | "js" | "node" => Ok(ReplRuntime {
+        });
+    }
+    match lang.as_str() {
+        "javascript" | "js" | "node" | "nodejs" => Ok(ReplRuntime {
             program: detect_first_command(&["node"])
                 .ok_or_else(|| String::from("node runtime not found"))?,
             args: &["-e"],
         }),
-        "sh" | "shell" | "bash" => Ok(ReplRuntime {
+        "sh" | "shell" | "bash" | "zsh" => Ok(ReplRuntime {
             program: detect_first_command(&["bash", "sh"])
                 .ok_or_else(|| String::from("shell runtime not found"))?,
             args: &["-lc"],
@@ -2899,12 +2905,30 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_repl_runtime;
     use std::collections::BTreeSet;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, OnceLock};
+
+    #[test]
+    fn repl_runtime_accepts_python_aliases() {
+        // "python3"/"py3" must resolve to the python runtime, not be rejected
+        // as an unsupported language (regression: models emit "python3").
+        for alias in ["python", "py", "python3", "py3", "Python3"] {
+            let rt = resolve_repl_runtime(alias)
+                .unwrap_or_else(|e| panic!("alias {alias} rejected: {e}"));
+            assert_eq!(rt.args, ["-c"], "alias {alias} should map to python");
+        }
+    }
+
+    #[test]
+    fn repl_runtime_rejects_unknown_language() {
+        let err = resolve_repl_runtime("ruby").unwrap_err();
+        assert!(err.contains("unsupported REPL language"));
+    }
     use std::thread;
     use std::time::Duration;
 

@@ -3055,6 +3055,76 @@ impl CtfApiClient {
     }
 }
 
+/// Strips `<think>...</think>` reasoning blocks that some models (e.g.
+/// Qwen-derived Qwythos) emit as plain text over the `OpenAI` chat backend,
+/// where the reasoning is *not* delivered in a structured field. Without this,
+/// the chain-of-thought leaks into the visible transcript, pollutes the
+/// conversation history fed back to the model, and gets mistaken for a flag
+/// candidate when the model "thinks out loud" about the flag format.
+///
+/// Handles tags split across streaming chunks (via `carry`). Some models begin
+/// in reasoning mode and emit a closing `</think>` with no opening tag; when
+/// that happens `drop_preceding` is set so the caller can discard text that was
+/// already streamed before the close.
+#[derive(Default)]
+struct ThinkFilter {
+    in_think: bool,
+    saw_open: bool,
+    carry: String,
+    /// One-shot signal: an unmatched `</think>` just closed implicit leading
+    /// reasoning, so any text accumulated before it should be dropped.
+    drop_preceding: bool,
+}
+
+impl ThinkFilter {
+    /// Feed one streaming text delta; returns only the visible (non-reasoning)
+    /// portion. A trailing partial tag is buffered and resolved on the next call.
+    fn push(&mut self, chunk: &str) -> String {
+        let mut data = std::mem::take(&mut self.carry);
+        data.push_str(chunk);
+        let mut out = String::new();
+        let mut s = data.as_str();
+        loop {
+            let Some(pos) = s.find('<') else {
+                if !self.in_think {
+                    out.push_str(s);
+                }
+                break;
+            };
+            let (before, rest) = s.split_at(pos);
+            if !self.in_think {
+                out.push_str(before);
+            }
+            if let Some(r) = rest.strip_prefix("<think>") {
+                self.in_think = true;
+                self.saw_open = true;
+                s = r;
+            } else if let Some(r) = rest.strip_prefix("</think>") {
+                if !self.saw_open {
+                    // Closing tag with no matching open: the model started in
+                    // reasoning mode, so everything emitted so far was thinking.
+                    self.drop_preceding = true;
+                    self.saw_open = true;
+                    out.clear();
+                }
+                self.in_think = false;
+                s = r;
+            } else if "<think>".starts_with(rest) || "</think>".starts_with(rest) {
+                // Partial tag at the tail — buffer until the next chunk completes it.
+                self.carry = rest.to_string();
+                break;
+            } else {
+                // A lone '<' that is not a think tag — keep it if visible.
+                if !self.in_think {
+                    out.push('<');
+                }
+                s = &rest[1..];
+            }
+        }
+        out
+    }
+}
+
 /// Models that only work on /v1/responses (not /v1/chat/completions).
 fn needs_responses_api(model: &str) -> bool {
     model.starts_with("codex")
@@ -3444,6 +3514,7 @@ impl CtfApiClient {
                 let mut printed_label = false;
                 let mut assistant_text = String::new();
                 let mut fallback_tools_emitted = false;
+                let mut think_filter = ThinkFilter::default();
                 let mut thinking = Some(ThinkingSpinner::start(format!("{C_TEAL}Thinking…{C_RESET}")));
 
                 tokio::pin!(bytes);
@@ -3498,23 +3569,39 @@ impl CtfApiClient {
                             continue;
                         };
 
-                        // Text content
+                        // Text content — strip <think> reasoning before it
+                        // reaches the transcript, history, or flag extraction.
                         if let Some(text) = delta.get("content").and_then(Value::as_str) {
                             if !text.is_empty() {
-                                assistant_text.push_str(text);
-                                if !printed_label {
-                                    printed_label = true;
-                                    if let Some(t) = thinking.take() { t.stop(); }
-                                    write!(stdout, "{}", assistant_label())
-                                        .and_then(|()| stdout.flush())
-                                        .map_err(|e| RuntimeError::new(e.to_string()))?;
+                                let visible = think_filter.push(text);
+                                if think_filter.drop_preceding {
+                                    // Implicit leading reasoning just closed:
+                                    // discard everything streamed before it.
+                                    think_filter.drop_preceding = false;
+                                    assistant_text.clear();
+                                    events.retain(|e| {
+                                        !matches!(e, AssistantEvent::TextDelta(_))
+                                    });
+                                    markdown_state = MarkdownStreamState::default();
                                 }
-                                if let Some(rendered) = markdown_state.push(&renderer, text) {
-                                    write!(stdout, "{rendered}")
-                                        .and_then(|()| stdout.flush())
-                                        .map_err(|e| RuntimeError::new(e.to_string()))?;
+                                if !visible.is_empty() {
+                                    assistant_text.push_str(&visible);
+                                    if !printed_label {
+                                        printed_label = true;
+                                        if let Some(t) = thinking.take() { t.stop(); }
+                                        write!(stdout, "{}", assistant_label())
+                                            .and_then(|()| stdout.flush())
+                                            .map_err(|e| RuntimeError::new(e.to_string()))?;
+                                    }
+                                    if let Some(rendered) =
+                                        markdown_state.push(&renderer, &visible)
+                                    {
+                                        write!(stdout, "{rendered}")
+                                            .and_then(|()| stdout.flush())
+                                            .map_err(|e| RuntimeError::new(e.to_string()))?;
+                                    }
+                                    events.push(AssistantEvent::TextDelta(visible));
                                 }
-                                events.push(AssistantEvent::TextDelta(text.to_string()));
                             }
                         }
 
@@ -3540,9 +3627,12 @@ impl CtfApiClient {
                             }
                         }
 
-                        // Finish reason — flush any pending tool calls
+                        // Finish reason — flush any pending tool calls. "length"
+                        // (generation hit max_tokens) is treated as a clean stop
+                        // so the turn's content is kept instead of being dropped
+                        // as an unterminated stream.
                         if choice.get("finish_reason").and_then(Value::as_str)
-                            .is_some_and(|r| r == "tool_calls" || r == "stop")
+                            .is_some_and(|r| r == "tool_calls" || r == "stop" || r == "length")
                         {
                             if let Some(t) = thinking.take() { t.stop(); }
                             if let Some(rendered) = markdown_state.flush(&renderer) {
@@ -3996,7 +4086,8 @@ fn ctf_binary_recon(path: &str) -> String {
     let esc = path.replace('\'', "'\\''");
     let mut out = String::new();
 
-    out.push_str(&format!("=== file ===\n{}\n", sh(&format!("file '{esc}'"))));
+    let file_out = sh(&format!("file '{esc}'"));
+    out.push_str(&format!("=== file ===\n{file_out}\n"));
 
     let checksec = sh(&format!(
         "checksec --file='{esc}' 2>/dev/null || checksec --binary='{esc}' 2>/dev/null"
@@ -4025,6 +4116,68 @@ fn ctf_binary_recon(path: &str) -> String {
 
     let strings = sh(&format!("strings -n8 '{esc}' 2>/dev/null | head -60"));
     out.push_str(&format!("=== strings (first 60) ===\n{strings}\n"));
+
+    if file_out.contains("ELF") {
+        // Imports expose libc calls (strcmp/memcmp/system/...) that reveal the
+        // logic even when the binary is stripped of its own symbols.
+        let imports = sh(&format!("rabin2 -i '{esc}' 2>/dev/null | head -40"));
+        if !imports.trim().is_empty() {
+            out.push_str(&format!("=== imports (rabin2) ===\n{imports}\n"));
+        }
+
+        // radare2 auto-analysis. On a stripped binary r2 often cannot label
+        // `main`, so first recover the function list, then disassemble the entry
+        // stub plus the largest recovered function (the heuristic "main": the
+        // real logic is almost always the biggest non-library function).
+        // `timeout` guards against analysis hangs on large/obfuscated binaries.
+        let afl = sh(&format!(
+            "timeout 60 r2 -e scr.color=0 -A -q -c afl '{esc}' 2>/dev/null"
+        ));
+        // afl columns: <addr> <nbbs> <size> [-> <realsz>] <name>
+        let biggest = afl
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let addr = it.next()?;
+                let _nbbs = it.next()?;
+                let size: u64 = it.next()?.parse().ok()?;
+                addr.starts_with("0x").then(|| (size, addr.to_string()))
+            })
+            .max_by_key(|(size, _)| *size)
+            .map(|(_, addr)| addr);
+        let target = biggest.as_deref().unwrap_or("entry0");
+        let disasm = sh(&format!(
+            "timeout 60 r2 -e scr.color=0 -A -q -c \
+             '?e ==== disasm main (if symbolised) ====; pdf @ main; \
+              ?e ==== disasm entry0 ====; pdf @ entry0; \
+              ?e ==== disasm largest fn ({target}, likely main) ====; pdf @ {target}' \
+             '{esc}' 2>/dev/null | head -400"
+        ));
+        if afl.trim().is_empty() && disasm.trim().is_empty() {
+            out.push_str(
+                "=== disasm ===\n(radare2 produced no output — install r2, or use \
+                 the `decompile` tool / `objdump -d` via bash)\n",
+            );
+        } else {
+            if !disasm.trim().is_empty() {
+                out.push_str(&format!(
+                    "=== r2 disasm (entry0 + largest fn) ===\n{disasm}\n"
+                ));
+            }
+            let afl_preview = afl.lines().take(50).collect::<Vec<_>>().join("\n");
+            out.push_str(&format!(
+                "=== functions (afl; use `decompile <name>` to dig in) ===\n{afl_preview}\n"
+            ));
+        }
+    } else {
+        // Non-ELF inputs (firmware blobs, packed containers, raw `data` files):
+        // a hexdump exposes magic bytes, offsets, and embedded structure that
+        // `file`/`strings` alone miss.
+        let hexdump = sh(&format!("xxd '{esc}' 2>/dev/null | head -40"));
+        if !hexdump.trim().is_empty() {
+            out.push_str(&format!("=== hexdump (first 40 lines) ===\n{hexdump}\n"));
+        }
+    }
 
     out.trim_end().to_string()
 }
@@ -6352,7 +6505,7 @@ impl ToolExecutor for CtfToolExecutor {
                 .get("language")
                 .and_then(Value::as_str)
                 .unwrap_or("python");
-            if matches!(lang.to_ascii_lowercase().as_str(), "python" | "py") {
+            if lang.to_ascii_lowercase().starts_with("py") {
                 let code = effective_input
                     .get("code")
                     .and_then(Value::as_str)
@@ -6809,9 +6962,12 @@ fn ctf_tool_specs() -> Vec<tools::ToolSpec> {
     // One call instead of 4-5 bash calls: file + checksec + strings + ldd + arch.
     specs.push(tools::ToolSpec {
         name: "binary_recon",
-        description: "All-in-one binary fingerprint: file type, ELF security flags (NX/PIE/canary/RELRO), \
-                       linked libraries, architecture, and a strings preview. Use this as the first step \
-                       on any binary before running GDB or writing an exploit.",
+        description: "All-in-one binary fingerprint AND disassembly. For ELF files: file type, security \
+                       flags (NX/PIE/canary/RELRO), linked libraries, strings preview, imports (libc \
+                       calls), plus radare2 disassembly of `main` and `entry0` and the recovered \
+                       function list — works on stripped binaries. For non-ELF/data files (firmware, \
+                       packed containers): adds a hexdump of the header. Use this as the FIRST step on \
+                       any binary; read the disassembly here before reaching for the `decompile` tool.",
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -7803,6 +7959,44 @@ fn render_export(session: &Session, divider: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn think_filter_all(f: &mut ThinkFilter, chunks: &[&str]) -> String {
+        chunks.iter().map(|c| f.push(c)).collect()
+    }
+
+    #[test]
+    fn think_filter_strips_inline_block() {
+        let mut f = ThinkFilter::default();
+        assert_eq!(
+            f.push("before <think>secret reasoning</think> after"),
+            "before  after"
+        );
+    }
+
+    #[test]
+    fn think_filter_handles_tag_split_across_chunks() {
+        let mut f = ThinkFilter::default();
+        // Tags arrive split mid-token across deltas.
+        let out = think_filter_all(&mut f, &["vis<thi", "nk>hidden<", "/think>tail"]);
+        assert_eq!(out, "vistail");
+    }
+
+    #[test]
+    fn think_filter_drops_implicit_leading_reasoning() {
+        let mut f = ThinkFilter::default();
+        // Model begins in reasoning mode: no opening tag, only a closing one.
+        let pre = f.push("planning the attack...");
+        assert_eq!(pre, "planning the attack...");
+        let post = f.push("</think>FLAG: real answer");
+        assert!(f.drop_preceding, "should request dropping pre-close text");
+        assert_eq!(post, "FLAG: real answer");
+    }
+
+    #[test]
+    fn think_filter_preserves_non_tag_angle_brackets() {
+        let mut f = ThinkFilter::default();
+        assert_eq!(f.push("a < b && c <html>"), "a < b && c <html>");
+    }
 
     fn green_executor() -> CtfToolExecutor {
         CtfToolExecutor {
